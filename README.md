@@ -38,4 +38,6 @@ Data used in this study are subject to restrictions arising from participant inf
 
 ## Citation
 
-If you use this code, please cite the corresponding manuscript(s). Citation details will be added on publication.
+If you use this code, please cite the corresponding manuscript(s) (see the preprint links above; citation details will be updated on publication) and, for the code itself:
+
+Jonathan Polonsky. (2026). jpolonsky/diphtheria-kano-2024: v1.0.0 (Version v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21907934
