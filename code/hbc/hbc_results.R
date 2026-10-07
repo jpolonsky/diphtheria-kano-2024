@@ -10,6 +10,7 @@ pacman::p_load(
   survey,
   srvyr,
   lme4,
+  lmerTest,
   broom,
   broom.mixed,
   gt,
@@ -39,10 +40,10 @@ dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 # ============================================================
 # 0. Data
 # ============================================================
-# df_pt: one row per enrolled patient (n=678)
+# df_pt: one row per interviewed patient (n=669)
 # df_cohort_samp: the originally-sampled cohort before tracing/replacement
-#   (n=986), used only for the attrition comparison below
-# df_hh: one row per household contact (n=5066), used for the household
+#   (n=986), used for the attrition comparison and selection weights below
+# df_hh: one row per household contact (n=5043), used for the household
 #   transmission analysis
 
 df_pt <- read_rds("data/df_pt.rds")
@@ -65,6 +66,17 @@ srv_design <- df_pt |> as_survey_design(strata = subclass, ids = NULL)
 nrow(df_pt)
 df_pt |> count(tx_mod)
 df_pt |> count(lga)
+
+# matched subclasses vary in size, and those holding one arm only don't
+# contribute to the conditional estimates
+subclass_sizes <- df_pt |>
+  group_by(subclass) |>
+  summarise(size = n(), n_arms = n_distinct(tx_mod))
+nrow(subclass_sizes)
+range(subclass_sizes$size)
+subclass_sizes |>
+  filter(n_arms == 1) |>
+  summarise(n_subclasses = n(), n_patients = sum(size))
 
 df_pt |>
   summarise(
@@ -170,14 +182,17 @@ is_replacement <- !(df_pt$case_id %in% df_cohort_samp$case_id)
 sum(is_replacement)
 df_pt |>
   mutate(is_replacement = is_replacement) |>
-  count(tx_mod, is_replacement)
+  group_by(tx_mod, is_replacement) |>
+  summarise(n = n(), deaths = sum(died), .groups = "drop")
 
 for (v in c("tx_location", "sex", "age_group", "vaccination_status")) {
-  p <- chisq.test(table(df_attr[[v]], df_attr$traced))$p.value
+  tab <- table(df_attr[[v]], df_attr$traced)
+  print(tab)
+  p <- chisq.test(tab)$p.value
   cat(sprintf("%s: p=%.4f\n", v, p))
 }
 
-# S1 Table: standardised mean differences on the matching variables (should
+# S5 Table: standardised mean differences on the matching variables (should
 # be ~0 by construction) and on two variables not used for matching, where
 # imbalance is expected
 smd_binary <- function(x, tx) {
@@ -224,22 +239,35 @@ balance_unmatched <- tibble(
     smd_binary(as.integer(df_pt$complication), df_pt$tx_mod)
   )
 )
-s1_table_balance <- bind_rows(balance_matched, balance_unmatched)
-print(s1_table_balance, n = Inf)
-write_csv(s1_table_balance, file.path(tab_dir, "S1_table_balance_smd.csv"))
+s5_table_balance <- bind_rows(balance_matched, balance_unmatched)
+print(s5_table_balance, n = Inf)
+write_csv(s5_table_balance, file.path(tab_dir, "S5_table_balance_smd.csv"))
 
-# Figure 2: epidemic curve by treatment modality
+# date of notification by arm (date_onset holds the registry notification
+# date); HBC was introduced in July 2023
+df_pt |>
+  group_by(tx_mod) |>
+  summarise(
+    median_notified = median(date_onset),
+    q1 = quantile(date_onset, .25, type = 1),
+    q3 = quantile(date_onset, .75, type = 1),
+    before_jul_2023 = sum(date_onset < as.Date("2023-07-01"))
+  )
+
+# Figure 2: epidemic curve, one panel per arm on a common date axis
 epicurve <- df_pt |>
   mutate(week = floor_date(date_onset, unit = "week")) |>
   count(tx_mod, week) |>
   ggplot(aes(week, n, fill = tx_mod)) +
   geom_col(colour = "black") +
+  facet_wrap(~tx_mod, ncol = 1) +
   scale_fill_manual(
     name = "Treatment",
     values = c(HBC = "#1b9e77", DTC = "#d95f02")
   ) +
   scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 month") +
-  labs(x = "Date of symptom onset", y = "Number of patients") +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  labs(x = "Date of notification", y = "Number of patients") +
   theme_classic()
 ggsave(
   file.path(fig_dir, "figure2_epicurve.jpg"),
@@ -255,6 +283,27 @@ ggsave(
 df_mort <- df_pt |> filter(!is.na(subclass), !is.na(delay_tx))
 nrow(df_mort)
 sum(df_mort$died)
+
+# case fatality risk, design-based with subclass as stratum
+srv_design |>
+  summarise(cfr = survey_mean((died == TRUE) * 100, vartype = "ci"))
+srv_design |>
+  group_by(tx_mod) |>
+  summarise(cfr = survey_mean((died == TRUE) * 100, vartype = "ci"))
+df_pt |>
+  group_by(age_grp) |>
+  summarise(n = n(), deaths = sum(died))
+
+# design-based risk ratios: population-averaged, so unlike the conditional
+# models below they include patients in single-arm subclasses
+svyglm(died ~ tx_mod, design = srv_design, family = quasipoisson) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE)
+svyglm(
+  died ~ tx_mod + age + vaccinated + delay_tx,
+  design = srv_design,
+  family = quasipoisson
+) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE)
 
 # unadjusted, one term at a time, same sample and stratification as the
 # adjusted models below
@@ -354,8 +403,7 @@ mod_with_cal <- clogit(
   data = df_mort
 )
 anova(mod_no_cal, mod_with_cal)
-tidy(mod_with_cal, exponentiate = TRUE, conf.int = TRUE) |>
-  filter(term == "tx_modHBC")
+tidy(mod_with_cal, exponentiate = TRUE, conf.int = TRUE)
 
 # epidemic phase: check whether the treatment effect differs before/after
 # the median onset date
@@ -364,6 +412,10 @@ df_phase <- df_mort |>
     early_phase = as.integer(date_onset <= median(date_onset, na.rm = TRUE))
   )
 median(df_phase$date_onset, na.rm = TRUE)
+# no HBC deaths in the early phase, so the interaction term is not estimable
+df_phase |>
+  group_by(early_phase, tx_mod) |>
+  summarise(n = n(), deaths = sum(died), .groups = "drop")
 mod_phase <- clogit(
   died ~ tx_mod * early_phase + age + vaccinated + delay_ge4 + strata(subclass),
   data = df_phase
@@ -420,6 +472,7 @@ mod_iptw <- glm(
 r_iptw <- coeftest(mod_iptw, vcov = vcovHC(mod_iptw, type = "HC1"))
 exp(coef(mod_iptw)["tx_hbc"])
 exp(coef(mod_iptw)["tx_hbc"] + c(-1, 1) * 1.96 * r_iptw["tx_hbc", "Std. Error"])
+r_iptw["tx_hbc", "Pr(>|z|)"]
 
 mod_dr <- glm(
   died ~ tx_hbc + age + vaccinated + delay_tx,
@@ -429,6 +482,34 @@ mod_dr <- glm(
 )
 r_dr <- coeftest(mod_dr, vcov = vcovHC(mod_dr, type = "HC1"))
 exp(coef(mod_dr)["tx_hbc"])
+exp(coef(mod_dr)["tx_hbc"] + c(-1, 1) * 1.96 * r_dr["tx_hbc", "Std. Error"])
+r_dr["tx_hbc", "Pr(>|z|)"]
+
+# marginal risk ratio (quasi-Poisson) and risk difference (identity link,
+# in percentage points), same weights
+mod_iptw_rr <- glm(
+  died ~ tx_hbc,
+  data = df_ps,
+  family = quasipoisson,
+  weights = iptw_trimmed
+)
+r_iptw_rr <- coeftest(mod_iptw_rr, vcov = vcovHC(mod_iptw_rr, type = "HC1"))
+exp(r_iptw_rr["tx_hbc", 1] + c(0, -1, 1) * 1.96 * r_iptw_rr["tx_hbc", 2])
+r_iptw_rr["tx_hbc", 4]
+
+mod_iptw_rd <- glm(
+  died ~ tx_hbc,
+  data = df_ps,
+  family = gaussian,
+  weights = iptw_trimmed
+)
+r_iptw_rd <- coeftest(mod_iptw_rd, vcov = vcovHC(mod_iptw_rd, type = "HC1"))
+100 * (r_iptw_rd["tx_hbc", 1] + c(0, -1, 1) * 1.96 * r_iptw_rd["tx_hbc", 2])
+r_iptw_rd["tx_hbc", 4]
+
+df_ps |>
+  group_by(tx_mod) |>
+  summarise(weighted_mortality = 100 * weighted.mean(died, iptw_trimmed))
 
 # balance and overlap diagnostics for the weighting
 range(df_ps$ps)
@@ -436,6 +517,8 @@ mean(df_ps$ps < 0.05 | df_ps$ps > 0.95)
 
 ps_range_hbc <- range(df_ps$ps[df_ps$tx_dtc == 0])
 ps_range_dtc <- range(df_ps$ps[df_ps$tx_dtc == 1])
+ps_range_dtc
+ps_range_hbc
 common_lo <- max(ps_range_hbc[1], ps_range_dtc[1])
 common_hi <- min(ps_range_hbc[2], ps_range_dtc[2])
 sum(df_ps$ps < common_lo | df_ps$ps > common_hi)
@@ -491,9 +574,10 @@ trim_fit <- function(probs) {
   m <- glm(died ~ tx_hbc, data = df_ps, family = quasibinomial, weights = w)
   r <- coeftest(m, vcov = vcovHC(m, type = "HC1"))
   c(
-    aOR = exp(coef(m)["tx_hbc"]),
+    or = exp(coef(m)["tx_hbc"]),
     lo = exp(coef(m)["tx_hbc"] - 1.96 * r["tx_hbc", "Std. Error"]),
-    hi = exp(coef(m)["tx_hbc"] + 1.96 * r["tx_hbc", "Std. Error"])
+    hi = exp(coef(m)["tx_hbc"] + 1.96 * r["tx_hbc", "Std. Error"]),
+    p = r["tx_hbc", "Pr(>|z|)"]
   )
 }
 trim_fit(c(0, 1))
@@ -501,24 +585,51 @@ trim_fit(c(.05, .95))
 trim_fit(c(.01, .99))
 
 # selection-IPW: reweight the IPTW estimate for differential tracing
-# success by sex/vaccination status found in the attrition check above
+# success by sex/vaccination status found in the attrition check above.
+# Replacements take the probability predicted from their own registry
+# values, assuming they resemble originals with the same values.
 sel_mod <- glm(
   traced ~ sex + age_group + vaccination_status + tx_location,
   data = df_attr,
   family = binomial
 )
-df_attr <- df_attr |> mutate(p_traced = predict(sel_mod, type = "response"))
 marg_traced <- mean(df_attr$traced)
 
-df_sel_w <- df_attr |>
-  filter(traced) |>
-  transmute(case_id, sel_weight = marg_traced / p_traced)
 df_ps_sel <- df_ps |>
-  left_join(df_sel_w, by = "case_id") |>
   mutate(
-    sel_weight = if_else(is.na(sel_weight), 1, sel_weight),
+    is_replacement = !(case_id %in% df_cohort_samp$case_id),
+    p_traced = predict(
+      sel_mod,
+      newdata = tibble(
+        sex = sex_reg,
+        age_group = age_grp_reg,
+        vaccination_status = vacc_status_reg,
+        tx_location = if_else(tx_mod == "HBC", "home", "hosp")
+      ),
+      type = "response"
+    ),
+    sel_weight = marg_traced / p_traced,
     combined_weight = iptw_trimmed * sel_weight
   )
+range(df_ps_sel$sel_weight)
+df_ps_sel |>
+  group_by(is_replacement) |>
+  summarise(mean_weight = mean(sel_weight))
+
+mod_sel_marginal <- glm(
+  died ~ tx_hbc,
+  data = df_ps_sel,
+  family = quasibinomial,
+  weights = combined_weight
+)
+r_sel_marginal <- coeftest(
+  mod_sel_marginal,
+  vcov = vcovHC(mod_sel_marginal, type = "HC1")
+)
+exp(
+  r_sel_marginal["tx_hbc", 1] + c(0, -1, 1) * 1.96 * r_sel_marginal["tx_hbc", 2]
+)
+r_sel_marginal["tx_hbc", 4]
 
 mod_sel_iptw <- glm(
   died ~ tx_hbc + age + vaccinated + delay_tx,
@@ -531,6 +642,68 @@ exp(coef(mod_sel_iptw)["tx_hbc"])
 exp(
   coef(mod_sel_iptw)["tx_hbc"] + c(-1, 1) * 1.96 * r_sel["tx_hbc", "Std. Error"]
 )
+r_sel["tx_hbc", "Pr(>|z|)"]
+
+# originally sampled patients only (no replacements): primary model, Firth
+# and IPTW, with the propensity model re-estimated in this subset
+df_orig <- df_mort |> filter(case_id %in% df_cohort_samp$case_id)
+nrow(df_orig)
+sum(df_orig$died)
+mod_orig <- clogit(
+  died ~ tx_mod + age + vaccinated + delay_tx + strata(subclass),
+  data = df_orig
+)
+tidy(mod_orig, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term == "tx_modHBC")
+
+# deaths in subclasses that inform the conditional estimate (both arms
+# present and the outcome varies)
+df_orig |>
+  group_by(subclass) |>
+  filter(n_distinct(tx_mod) == 2, any(died), !all(died)) |>
+  ungroup() |>
+  summarise(
+    n_subclasses = n_distinct(subclass),
+    deaths = sum(died),
+    deaths_hbc = sum(died & tx_mod == "HBC")
+  )
+
+mod_firth_orig <- logistf::logistf(
+  died ~ tx_mod + age + vaccinated + delay_tx,
+  data = df_orig,
+  firth = TRUE
+)
+c(
+  or = exp(coef(mod_firth_orig)[["tx_modHBC"]]),
+  lo = exp(mod_firth_orig$ci.lower[["tx_modHBC"]]),
+  hi = exp(mod_firth_orig$ci.upper[["tx_modHBC"]]),
+  p = mod_firth_orig$prob[["tx_modHBC"]]
+)
+
+df_ps_orig <- df_ps |> filter(case_id %in% df_cohort_samp$case_id)
+ps_mod_orig <- glm(
+  tx_dtc ~ age + I(age^2) + sex + vaccinated + lga + hh_size,
+  data = df_ps_orig,
+  family = binomial
+)
+df_ps_orig <- df_ps_orig |>
+  mutate(
+    ps = predict(ps_mod_orig, type = "response"),
+    p_tx = mean(tx_dtc),
+    iptw_stab = if_else(tx_dtc == 1, p_tx / ps, (1 - p_tx) / (1 - ps)),
+    iptw_trimmed = pmin(
+      pmax(iptw_stab, quantile(iptw_stab, .01)),
+      quantile(iptw_stab, .99)
+    )
+  )
+mod_iptw_orig <- glm(
+  died ~ tx_hbc,
+  data = df_ps_orig,
+  family = quasibinomial,
+  weights = iptw_trimmed
+)
+r_iptw_orig <- coeftest(mod_iptw_orig, vcov = vcovHC(mod_iptw_orig, type = "HC1"))
+exp(r_iptw_orig["tx_hbc", 1] + c(0, -1, 1) * 1.96 * r_iptw_orig["tx_hbc", 2])
 
 # Firth-penalised logistic regression, small-sample bias correction given
 # the low events-per-variable ratio (24 deaths / 4 covariates). Firth's
@@ -593,6 +766,10 @@ n1 <- sum(obs)
 n0 <- sum(!obs)
 auc <- (sum(r[obs]) - n1 * (n1 + 1) / 2) / (n1 * n0)
 auc
+
+# within-subclass concordance of the conditional model itself
+conc_a <- concordance(mod_a)
+c(concordance = conc_a$concordance, se = sqrt(conc_a$var))
 
 tibble(pred = pred, obs = as.integer(obs)) |>
   mutate(quintile = ntile(pred, 5)) |>
@@ -660,17 +837,129 @@ mod_card <- clogit(
 )
 tidy(mod_card, exponentiate = TRUE, conf.int = TRUE)
 
+# stricter definition: card seen vs self-reported unvaccinated, everyone
+# else excluded
+df_card_seen <- df_pt |>
+  filter(!is.na(vacc_card_seen), !is.na(subclass), !is.na(delay_tx))
+nrow(df_card_seen)
+sum(df_card_seen$died)
+mod_card_seen <- clogit(
+  died ~ tx_mod + age + vacc_card_seen + delay_tx + strata(subclass),
+  data = df_card_seen
+)
+tidy(mod_card_seen, exponentiate = TRUE, conf.int = TRUE)
+
+# effect modification by treatment delay (days), against Model A
+mod_tx_delay <- clogit(
+  died ~ tx_mod * delay_tx + age + vaccinated + strata(subclass),
+  data = df_mort
+)
+tidy(mod_tx_delay, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term == "tx_modHBC:delay_tx")
+anova(mod_a, mod_tx_delay)
+
 # ============================================================
 # 4. Long-term sequelae
 # ============================================================
 
-df_pt |> filter(!died) |> count(!is.na(sequelae))
+# survivors only, Model A covariates and stratification. Complications are
+# left out as in Model A; all five complicated survivors were DTC, so they
+# can't be estimated in the conditional model anyway.
+df_seq <- df_mort |>
+  filter(!died) |>
+  mutate(has_sequelae = as.integer(!is.na(sequelae)))
+df_seq |>
+  group_by(tx_mod) |>
+  summarise(n = n(), sequelae = sum(has_sequelae))
+
+# subclasses that inform the conditional estimate (both arms present and
+# the outcome varies)
+df_seq |>
+  group_by(subclass) |>
+  filter(n_distinct(tx_mod) == 2, any(has_sequelae == 1), !all(has_sequelae == 1)) |>
+  ungroup() |>
+  summarise(
+    n_subclasses = n_distinct(subclass),
+    events_dtc = sum(has_sequelae[tx_mod == "DTC"]),
+    events_hbc = sum(has_sequelae[tx_mod == "HBC"])
+  )
+n_distinct(df_seq$subclass)
 
 mod_sequelae <- clogit(
-  !is.na(sequelae) ~ tx_mod + complication,
-  data = df_pt |> filter(!died %in% TRUE)
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx + strata(subclass),
+  data = df_seq
 )
 tidy(mod_sequelae, exponentiate = TRUE, conf.int = TRUE)
+
+# sensitivity analyses, given only 14 events
+clogit(has_sequelae ~ tx_mod + strata(subclass), data = df_seq) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE)
+
+firth_or <- function(m) {
+  tibble(
+    term = names(coef(m))[-1],
+    or = exp(coef(m))[-1],
+    lo = exp(m$ci.lower)[-1],
+    hi = exp(m$ci.upper)[-1],
+    p = m$prob[-1]
+  )
+}
+logistf::logistf(
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx,
+  data = df_seq,
+  firth = TRUE
+) |>
+  firth_or()
+logistf::logistf(
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx + complication,
+  data = df_seq,
+  firth = TRUE
+) |>
+  firth_or()
+
+df_seq_uncompl <- df_seq |> filter(!complication)
+nrow(df_seq_uncompl)
+clogit(
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx + strata(subclass),
+  data = df_seq_uncompl
+) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE)
+
+# design-based risk ratio and risk difference (percentage points), subclass
+# as stratum
+srv_seq <- df_seq |> as_survey_design(strata = subclass, ids = NULL)
+svyglm(
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx,
+  design = srv_seq,
+  family = quasipoisson
+) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term == "tx_modHBC")
+svyglm(
+  has_sequelae ~ tx_mod + age + vaccinated + delay_tx,
+  design = srv_seq
+) |>
+  tidy(conf.int = TRUE) |>
+  filter(term == "tx_modHBC") |>
+  mutate(across(c(estimate, conf.low, conf.high), \(x) 100 * x))
+
+# composite of death or long-term sequelae among all interviewed patients
+df_composite <- df_mort |>
+  mutate(death_or_sequelae = died | !is.na(sequelae))
+df_composite |>
+  group_by(tx_mod) |>
+  summarise(n = n(), events = sum(death_or_sequelae))
+clogit(
+  death_or_sequelae ~ tx_mod + age + vaccinated + delay_tx + strata(subclass),
+  data = df_composite
+) |>
+  tidy(exponentiate = TRUE, conf.int = TRUE)
+logistf::logistf(
+  death_or_sequelae ~ tx_mod + age + vaccinated + delay_tx,
+  data = df_composite,
+  firth = TRUE
+) |>
+  firth_or()
 
 # ============================================================
 # 5. Household transmission (Table 3)
@@ -697,7 +986,7 @@ sar_ci(
 )
 sar_ci(sum(df_hh$hh_case == 1, na.rm = TRUE), nrow(df_hh))
 
-df_hh |>
+sar_tx <- df_hh |>
   filter(!is.na(tx_mod)) |>
   group_by(tx_mod) |>
   summarise(
@@ -712,6 +1001,22 @@ df_hh |>
     ),
     sec_any = sum(hh_case == 1, na.rm = TRUE)
   )
+sar_tx
+
+# Table 3 by arm, exact binomial CIs
+sar_tx |>
+  pivot_longer(starts_with("sec_"), names_to = "window", values_to = "cases") |>
+  mutate(ci = map2(cases, n, sar_ci)) |>
+  unnest_wider(ci)
+
+# index households with a secondary case in the primary window
+df_hh |>
+  group_by(tx_mod, parent_index) |>
+  summarise(
+    case_14 = any(hh_case == 1 & timing_days >= 2 & timing_days <= 14, na.rm = TRUE),
+    .groups = "drop_last"
+  ) |>
+  summarise(households = n(), with_case = sum(case_14))
 
 # multivariable model, restricted to the primary 2-14 day window, SEs
 # clustered by index-case household
@@ -877,9 +1182,15 @@ df_pt |>
   summarise(
     across(
       c(score_improve, score_acceptable, score_quality, score_mean),
-      list(mean = ~ mean(.x, na.rm = TRUE), median = ~ median(.x, na.rm = TRUE))
+      list(
+        mean = \(x) mean(x, na.rm = TRUE),
+        sd = \(x) sd(x, na.rm = TRUE),
+        median = \(x) median(x, na.rm = TRUE)
+      )
     )
-  )
+  ) |>
+  pivot_longer(-tx_mod) |>
+  print(n = Inf)
 
 for (v in c("score_improve", "score_acceptable", "score_quality")) {
   wt <- wilcox.test(
@@ -889,12 +1200,26 @@ for (v in c("score_improve", "score_acceptable", "score_quality")) {
   cat(sprintf("%s: W=%.0f, p=%.4f\n", v, wt$statistic, wt$p.value))
 }
 
-# linear mixed-effects model, matched subclass as a random intercept
-mod_acceptability <- lmer(
-  score_acceptable ~ tx_mod + delay_ge4 + complication + (1 | subclass),
-  data = df_pt
+# linear mixed-effects models, matched subclass as a random intercept, one
+# per dimension and for the composite. Identity link, so the coefficients
+# are mean differences in Likert points (HBC minus DTC), not exponentiated.
+acceptability_lmm <- map_dfr(
+  c("score_acceptable", "score_quality", "score_improve", "score_mean"),
+  \(v) {
+    m <- lmer(
+      as.formula(paste0(v, " ~ tx_mod + delay_ge4 + complication + (1 | subclass)")),
+      data = df_pt
+    )
+    tidy(m, effects = "fixed", conf.int = TRUE) |>
+      filter(term != "(Intercept)") |>
+      mutate(
+        outcome = v,
+        n = nobs(m),
+        subclass_var = as.data.frame(VarCorr(m))$vcov[1]
+      )
+  }
 )
-tidy(mod_acceptability, exponentiate = TRUE, conf.int = TRUE)
+print(acceptability_lmm, n = Inf, width = Inf)
 
 # ordinal (cumulative-link) sensitivity models, all three Likert dimensions
 df_pt_ord <- df_pt |>
@@ -925,6 +1250,52 @@ ordinal_results <- bind_rows(
   fit_ordinal("score_quality_ord", "Quality"),
   fit_ordinal("score_improve_ord", "Perceived improvement")
 )
+print(ordinal_results, n = Inf)
+
+# a subclass random intercept can't be estimated in these models (variance
+# ~0), so CIs for treatment and delay come from resampling subclasses
+# instead: 2,000 replicates, percentile intervals, non-converged fits
+# dropped. Complication is too unstable in resamples to bootstrap.
+set.seed(2026)
+boot_ordinal <- function(outcome_var, label, n_boot = 2000) {
+  d <- df_pt_ord |> filter(!is.na(subclass))
+  subclasses <- unique(d$subclass)
+  rows <- split(seq_len(nrow(d)), d$subclass)
+  f <- as.formula(paste0(outcome_var, " ~ tx_mod + delay_ge4 + complication"))
+  map_dfr(seq_len(n_boot), \(b) {
+    sampled <- sample(subclasses, length(subclasses), replace = TRUE)
+    fit <- tryCatch(
+      suppressWarnings(
+        ordinal::clm(f, data = d[unlist(rows[as.character(sampled)]), ])
+      ),
+      error = \(e) NULL
+    )
+    tibble(
+      dimension = label,
+      converged = !is.null(fit) && fit$convergence$code == 0,
+      tx_modHBC = if (is.null(fit)) NA else coef(fit)["tx_modHBC"],
+      delay_ge4TRUE = if (is.null(fit)) NA else coef(fit)["delay_ge4TRUE"]
+    )
+  })
+}
+ordinal_boot <- bind_rows(
+  boot_ordinal("score_acceptable_ord", "Acceptability"),
+  boot_ordinal("score_quality_ord", "Quality"),
+  boot_ordinal("score_improve_ord", "Perceived improvement")
+)
+ordinal_boot |> count(dimension, converged)
+
+ordinal_boot_ci <- ordinal_boot |>
+  filter(converged) |>
+  pivot_longer(c(tx_modHBC, delay_ge4TRUE), names_to = "term") |>
+  group_by(dimension, term) |>
+  summarise(
+    boot_lo = exp(quantile(value, .025, na.rm = TRUE)),
+    boot_hi = exp(quantile(value, .975, na.rm = TRUE)),
+    .groups = "drop"
+  )
+ordinal_results <- ordinal_results |>
+  left_join(ordinal_boot_ci, by = c("dimension", "term"))
 print(ordinal_results, n = Inf)
 
 # ============================================================
@@ -973,11 +1344,11 @@ s_table_sar_rr <- sar_multivariable |>
 gt(s_table_sar_rr) |>
   tab_header(
     title = md(
-      "**S Table. Odds ratios and risk ratios for household secondary attack**"
+      "**S3 Table. Odds ratios and risk ratios for household secondary attack**"
     )
   ) |>
   gt_style() |>
-  gtsave(file.path(tab_dir, "S_table_SAR_risk_ratios.docx"))
+  gtsave(file.path(tab_dir, "S3_table_SAR_risk_ratios.docx"))
 
 s_table_iptw <- bind_rows(
   tibble(
@@ -1001,20 +1372,29 @@ s_table_iptw <- bind_rows(
   )
 )
 gt(s_table_iptw, groupname_col = "Section") |>
-  tab_header(title = md("**S Table. Propensity score diagnostics**")) |>
+  tab_header(title = md("**S4 Table. Propensity score diagnostics**")) |>
   gt_style() |>
-  gtsave(file.path(tab_dir, "S_table_IPTW_diagnostics.docx"))
+  gtsave(file.path(tab_dir, "S4_table_IPTW_diagnostics.docx"))
 
+# bootstrap CIs for treatment and delay, model-based (Wald) CIs for
+# complication
 s_table_ordinal <- ordinal_results |>
   transmute(
     Dimension = dimension,
     Term = term,
-    `OR (95% CI)` = fmt_ci(OR, lo, hi),
+    `OR (95% CI)` = if_else(
+      is.na(boot_lo),
+      paste(fmt_ci(OR, lo, hi), "†"),
+      fmt_ci(OR, boot_lo, boot_hi)
+    ),
     p = sprintf("%.3f", p)
   )
 gt(s_table_ordinal, groupname_col = "Dimension") |>
   tab_header(
-    title = md("**S Table. Ordinal (cumulative-link) acceptability models**")
+    title = md("**S6 Table. Ordinal (cumulative-link) acceptability models**")
+  ) |>
+  tab_source_note(
+    "CIs are subclass-bootstrap percentile intervals, except † model-based Wald intervals; p-values are model-based."
   ) |>
   gt_style() |>
-  gtsave(file.path(tab_dir, "S_table_ordinal_acceptability.docx"))
+  gtsave(file.path(tab_dir, "S6_table_ordinal_acceptability.docx"))

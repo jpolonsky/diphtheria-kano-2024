@@ -9,6 +9,13 @@ pacman::p_load(here, tidyverse, haven, dm)
 load(here("output/hbc/data/cohort_sample_final.rds"))
 db_raw <- read_rds(here("data/hbc/cohort_study_kobo_snapshot_2026-07-23.rds"))
 
+# drop two re-entered interviews and one entered under the wrong patient ID,
+# then the interview refusals (consent = No), which carry no interview data.
+# dm_filter() drops their household rows too.
+db_raw <- db_raw |>
+  dm_filter(main = !(`_index` %in% c(571, 566, 40))) |>
+  dm_filter(main = as.character(haven::as_factor(consent)) == "Yes")
+
 df_subclass <- df_samp |> select(case_id, subclass, weights)
 
 df_pt <-
@@ -53,6 +60,12 @@ df_pt <-
         as.character(vacc_card) %in% c("Yes", "Yes, but it is missing/lost", "Was vaccinated in the DTC/OPD/Contact clinic") ~ 1L,
       as.character(vacc) == "Yes" & as.character(vacc_card) == "No" ~ 0L,
       TRUE ~ NA_integer_
+    ),
+    # stricter variant: card seen vs self-reported unvaccinated, all others missing
+    vacc_card_seen = case_when(
+      as.character(vacc) == "Yes" & as.character(vacc_card) == "Yes" ~ 1L,
+      as.character(vacc) == "No" ~ 0L,
+      .default = NA_integer_
     ),
     age_grp = cut(age, breaks = c(0, 5, 10, 15, Inf), labels = c("0-5", "6-10", "11-15", "16+"), right = TRUE, include.lowest = TRUE),
     delay_ge4 = case_when(delay_tx >= 4 ~ TRUE, delay_tx < 4 ~ FALSE, TRUE ~ NA),

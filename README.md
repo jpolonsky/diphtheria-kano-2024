@@ -2,7 +2,7 @@
 
 Analysis code for two companion studies of the 2023–24 diphtheria epidemic response in Kano State, Nigeria (MSF Operational Centre West and Central Africa, in collaboration with the Kano State Ministry of Health).
 
-- **Home-based care (HBC) study** (retrospective matched cohort comparing home-based care with facility-based treatment for mild diphtheria): `code/hbc/hbc_results.R`. Preprint: [medrxiv.org/content/10.64898/2026.04.10.26350586v1](https://www.medrxiv.org/content/10.64898/2026.04.10.26350586v1)
+- **Home-based care (HBC) study** (retrospective matched cohort comparing home-based care with facility-based treatment for mild diphtheria): `code/hbc/hbc_results.R`. Manuscript under revision at PLOS Medicine; preprint: [medrxiv.org/content/10.64898/2026.04.10.26350586v1](https://www.medrxiv.org/content/10.64898/2026.04.10.26350586v1)
 - **Household survey study** (population-based survey of community diphtheria burden): `code/srvy/srvy_results.R`. Preprint: [medrxiv.org/content/10.64898/2026.04.10.26348327v2](https://www.medrxiv.org/content/10.64898/2026.04.10.26348327v2)
 
 Each script reproduces every number, table and figure reported in its manuscript.
@@ -40,4 +40,4 @@ Data used in this study are subject to restrictions arising from participant inf
 
 If you use this code, please cite the corresponding manuscript(s) (see the preprint links above; citation details will be updated on publication) and, for the code itself:
 
-Jonathan Polonsky. (2026). jpolonsky/diphtheria-kano-2024: v1.0.0 (Version v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21907934
+Jonathan Polonsky. (2026). jpolonsky/diphtheria-kano-2024 [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21907933
