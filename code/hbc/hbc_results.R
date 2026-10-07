@@ -526,7 +526,7 @@ sum(df_ps$ps < common_lo | df_ps$ps > common_hi)
 ggplot(df_ps, aes(ps, fill = tx_mod)) +
   geom_density(alpha = 0.5) +
   scale_fill_manual(
-    values = c(HBC = "#1b9e77", DTC = "#7570b3"),
+    values = c(HBC = "#1b9e77", DTC = "#d95f02"),
     name = "Treatment"
   ) +
   labs(x = "Propensity score (P[DTC])", y = "Density") +
@@ -1358,7 +1358,7 @@ s_table_iptw <- bind_rows(
   ),
   tibble(
     Section = "Propensity score",
-    Metric = "Proportion PS <0.05 or >0.95",
+    Metric = "Proportion of propensity scores <0.05 or >0.95",
     Value = sprintf("%.1f%%", 100 * mean(df_ps$ps < 0.05 | df_ps$ps > 0.95))
   ),
   tibble(
