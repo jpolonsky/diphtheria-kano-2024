@@ -5,7 +5,7 @@ Analysis code for two companion studies of the 2023–24 diphtheria epidemic res
 - **Home-based care (HBC) study** (retrospective matched cohort comparing home-based care with facility-based treatment for mild diphtheria): `code/hbc/hbc_results.R`. Manuscript under revision at PLOS Medicine; preprint: [medrxiv.org/content/10.64898/2026.04.10.26350586v1](https://www.medrxiv.org/content/10.64898/2026.04.10.26350586v1)
 - **Household survey study** (population-based survey of community diphtheria burden): `code/srvy/srvy_results.R`. Preprint: [medrxiv.org/content/10.64898/2026.04.10.26348327v2](https://www.medrxiv.org/content/10.64898/2026.04.10.26348327v2)
 
-Each script reproduces every number, table and figure reported in its manuscript.
+`srvy_results.R` reproduces every number, table and figure reported in the survey manuscript. `hbc_results.R` reproduces the results reported in the HBC manuscript from the released input files, except for quantities that depend on information not in those files: the telephone tracing outcomes and reasons for non-interview, the link between replacement patients and the patients they replaced, the interval from notification to interview, the breakdown of sequelae, complication and comorbidity types, Figure 1 (the flow diagram), and the Total column of Table 1. S1 Table is printed rather than written to a file, and the balance, effective sample size and trimming results behind S4 Table are printed rather than tabulated.
 
 ## Structure
 
