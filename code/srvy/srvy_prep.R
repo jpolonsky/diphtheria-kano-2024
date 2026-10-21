@@ -375,13 +375,13 @@ df_ind <-
 df_ind_public <-
   df_ind |>
   select(
-    index_hh, index_ind, cluster, lga, weight, hh_size,
+    index_hh, index_ind, cluster, lga, weight, hh_size, vacc_belief_protect,
     age, age_cat, age_grp, age_grp_diph, sex,
     vacc, vacc_pre, vacc_card, vacc_epi_binary, vacc_camp_binary, vacc_ever,
     vacc_epi_confirmed, camp_confirmed, vacc_source, age_eligible,
     diphtheria, diagnosis, died, died_cause, died_diph_binary, died_location,
     date_onset, date_died, pt,
-    tx_seeking, tx_seeking_binary, tx_seeking_hsb, delay_tx, delay_tx_binary,
+    tx_seeking, tx_seeking_binary, tx_seeking_hsb, tx_location, delay_tx, delay_tx_binary,
     tx_hf_no_1, tx_hf_no_2, tx_hf_no_3, tx_hf_no_4, tx_hf_no_5, tx_hf_no_99,
     sequelae, ses_quintile, lat, lon
   )

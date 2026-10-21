@@ -2,14 +2,19 @@
 # State, Nigeria: population-based household survey.
 #
 # Reproduces every number, table and figure reported in the manuscript,
-# in the order they appear (Participants -> Community attack rate ->
-# Factors associated with diphtheria -> Mortality -> Health-seeking and
-# treatment delay -> Vaccination and mortality -> Vaccination sensitivity
-# analyses -> Vaccination coverage and campaign performance -> spatial
+# in the order they appear (Participants -> Community attack rate and
+# comparison with facility notifications -> Factors associated with
+# diphtheria -> Mortality -> Health-seeking and treatment delay ->
+# Vaccination and mortality -> Vaccination sensitivity analyses ->
+# Vaccination coverage and campaign performance -> Figure 1 -> spatial
 # figures and correlations). Input is the frozen, de-identified survey
-# dataset; see README for how to request it.
+# dataset; see README for how to request it. The facility comparator is a
+# fixed external count (MSF line list, aggregated in S2 Table), and a few
+# descriptive items rest on variables not in the released file (symptom
+# checklist, vaccination dates, household roster changes); those are not
+# recomputed.
 
-pacman::p_load(survey, srvyr, EValue, scales, sf, spatstat, stars, mgcv, metR, patchwork, tidyverse)
+pacman::p_load(survey, srvyr, scales, sf, spatstat, stars, mgcv, metR, patchwork, tidyverse)
 
 fig_dir <- "output/figures"
 tab_dir <- "output/tables"
@@ -26,7 +31,16 @@ dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 # map_boundaries: LGA and study-area boundary polygons, used only by the
 #   spatial figures at the end of this script
 
-df_ind <- read_rds("data/df_ind.rds")
+df_ind <- read_rds("data/df_ind.rds") |>
+  mutate(
+    # Table 4 EPI status: a card dated inside a campaign window (vacc_epi_confirmed
+    # NA, vacc_source camp_only) counts as a campaign dose, not a routine one, so
+    # those children sit in the "No reported routine EPI vaccination" row and
+    # Table 4 holds all 3,287 children with a classified vaccination source.
+    epi_t4 = if_else(is.na(vacc_epi_confirmed) & vacc_source == "camp_only", FALSE, vacc_epi_confirmed),
+    # restricted case definition: cases also reported as diagnosed by a health professional
+    diphtheria_corrob = diphtheria == TRUE & diagnosis == "Yes"
+  )
 df_hh <- read_rds("data/df_hh.rds")
 maps <- read_rds("data/map_boundaries.rds")
 map_nga_ward <- maps$map_nga_ward
@@ -47,35 +61,57 @@ nrow(df_hh)
 sum(df_hh$consent == "Yes")
 mean(df_hh$consent == "Yes")
 
-nrow(df_ind)
-sum(df_ind$died)
+# Diphtheria status is missing for some respondents. They are left out of the
+# diphtheria analyses but kept in the all-cause mortality analyses.
+flow_counts <- tibble(
+  item = c(
+    "Surveyed individuals", "Diphtheria status recorded", "Diphtheria cases", "No diphtheria",
+    "Diphtheria status not recorded", "Deaths, all cause", "Deaths with diphtheria status recorded"
+  ),
+  n = c(
+    nrow(df_ind), sum(!is.na(df_ind$diphtheria)), sum(df_ind$diphtheria, na.rm = TRUE), sum(!df_ind$diphtheria, na.rm = TRUE),
+    sum(is.na(df_ind$diphtheria)), sum(df_ind$died, na.rm = TRUE), sum(df_ind$died & !is.na(df_ind$diphtheria), na.rm = TRUE)
+  )
+)
+print(flow_counts)
+write_csv(flow_counts, file.path(tab_dir, "flow_counts.csv"))
+
+# enrolled households, clusters, and LGA-by-cluster units (the primary sampling units)
+df_ind |> summarise(n_households = n_distinct(index_hh), n_clusters = n_distinct(cluster), n_lga_clusters = n_distinct(paste(lga, cluster)))
 
 df_ind |>
-  summarise(pct_female = mean(sex == "Female") * 100, median_age = median(age), q1 = quantile(age, .25), q3 = quantile(age, .75))
+  summarise(
+    pct_female = mean(sex == "Female") * 100, median_age = median(age), q1 = quantile(age, .25), q3 = quantile(age, .75),
+    pct_age_le15 = mean(age <= 15) * 100
+  )
 
+# Table 1: counts are unweighted, column percentages survey-weighted, and
+# missing values are excluded from each variable
 table1_vars <- c("lga", "age_grp_diph", "sex", "vacc", "died")
 table_1 <-
   table1_vars |>
-  set_names() |>
-  map(\(v) {
-    df_ind |>
-      count(diphtheria, across(all_of(v))) |>
-      group_by(diphtheria) |>
-      mutate(pct = n / sum(n) * 100) |>
-      rename(level = 2) |>
-      mutate(level = as.character(level))
-  }) |>
-  list_rbind(names_to = "variable")
+  map_dfr(\(v) {
+    df_srvy_ind |>
+      filter(!is.na(diphtheria), !is.na(.data[[v]])) |>
+      mutate(level = as.character(.data[[v]])) |>
+      group_by(diphtheria, level) |>
+      summarise(n = unweighted(n()), pct = survey_prop() * 100, .groups = "drop") |>
+      mutate(variable = v)
+  })
 print(table_1, n = Inf)
 
-table1_chisq <- map_dfr(table1_vars, \(v) {
-  test <- survey::svychisq(as.formula(paste0("~", v, "+diphtheria")), design = df_srvy_ind, statistic = "Chisq")
-  tibble(variable = v, p = test$p.value)
+# Rao-Scott F tests of each characteristic against diphtheria status
+table_1_p <- map_dfr(table1_vars, \(v) {
+  d <- df_srvy_ind |> filter(!is.na(diphtheria), !is.na(.data[[v]]))
+  tibble(variable = v, p = svychisq(as.formula(paste0("~", v, "+diphtheria")), design = d)$p.value)
 })
-print(table1_chisq)
+print(table_1_p)
 
-write_csv(table_1, file.path(tab_dir, "table1_counts.csv"))
-write_csv(table1_chisq, file.path(tab_dir, "table1_chisq.csv"))
+# vaccination status missing, by diphtheria status
+df_ind |> filter(!is.na(diphtheria), is.na(vacc)) |> count(diphtheria)
+
+write_csv(table_1, file.path(tab_dir, "table1_weighted.csv"))
+write_csv(table_1_p, file.path(tab_dir, "table1_pvalues.csv"))
 
 # ============================================================
 # 2. Community attack rate and comparison with facility surveillance
@@ -90,14 +126,6 @@ df_srvy_ind |>
     ir = survey_ratio(numerator = diphtheria * 1000 * 365.25, denominator = pt, vartype = "ci", na.rm = TRUE)
   )
 
-# facility-reported AR for the same 4 LGAs (Abbas et al, ref 13): 262 per
-# 100,000 = 0.262%, a fixed external denominator, not survey data
-facility_ar <- 262 / 100000
-ar_est <- df_srvy_ind |> summarise(ar = survey_mean(diphtheria, vartype = "ci", na.rm = TRUE))
-ar_est$ar / facility_ar
-ar_est$ar_low / facility_ar
-ar_est$ar_upp / facility_ar
-
 df_srvy_ind |>
   group_by(age_grp_diph) |>
   summarise(attack_rate = survey_mean(diphtheria * 100, vartype = "ci", na.rm = TRUE))
@@ -105,6 +133,8 @@ df_srvy_ind |>
 df_srvy_ind |>
   group_by(sex) |>
   summarise(attack_rate = survey_mean(diphtheria * 100, vartype = "ci", na.rm = TRUE))
+
+svyttest(diphtheria ~ sex, design = df_srvy_ind)
 
 # household secondary attack rate: among households with >=1 case, how
 # many additional ("secondary") cases among the remaining household
@@ -122,23 +152,38 @@ sum(hh_summary$num_cases >= 2)
 hh_design <- hh_summary |> as_survey(ids = c(cluster, index_hh), strata = lga, weights = weight, nest = TRUE)
 hh_design |> summarise(SAR = survey_mean(sar * 100, vartype = "ci", deff = TRUE, na.rm = TRUE))
 
-# case-definition specificity sensitivity: restrict to cases additionally
-# reported as diagnosed by a health professional
-df_ind_corrob <- df_ind |> mutate(diphtheria_corrob = diphtheria == TRUE & diagnosis == "Yes")
-df_srvy_corrob <-
-  df_ind_corrob |>
-  filter(!is.na(cluster), !is.na(index_hh)) |>
-  as_survey(ids = c(cluster, index_hh), strata = lga, weights = weight, nest = TRUE)
+# Facility comparator for the same four LGAs: 9,864 residents notified at the
+# three MSF-supported sites (IDH, MMSH, WSGGH), dated by symptom onset, 1 January
+# 2023 to 25 October 2024 (the survey recall period), over a population of
+# 2,837,111 (WorldPop and National Population Commission estimates), or 347.7 per
+# 100,000. The counts come from the MSF line list, which is not public
+# (aggregated counts are in S2 Table), so this is a fixed external rate, not
+# survey data.
+facility_ar <- 9864 / 2837111
 
-df_srvy_corrob |> summarise(ar = survey_mean(diphtheria == TRUE, vartype = "ci", na.rm = TRUE))
-df_srvy_corrob |> summarise(ar = survey_mean(diphtheria_corrob, vartype = "ci", na.rm = TRUE))
+# Survey attack rate and its ratio to the facility rate, under the primary case
+# definition and the restricted one. The CI of the ratio reflects survey
+# sampling uncertainty only, since the facility rate is treated as fixed.
+ar_vs_facility <-
+  bind_rows(
+    df_srvy_ind |>
+      summarise(ar = survey_mean(diphtheria, vartype = "ci", na.rm = TRUE)) |>
+      mutate(definition = "Primary (suspected diphtheria)"),
+    df_srvy_ind |>
+      summarise(ar = survey_mean(diphtheria_corrob, vartype = "ci", na.rm = TRUE)) |>
+      mutate(definition = "Restricted (diagnosed by a health professional)")
+  ) |>
+  mutate(ratio = ar / facility_ar, ratio_low = ar_low / facility_ar, ratio_upp = ar_upp / facility_ar) |>
+  select(definition, ar, ar_low, ar_upp, ratio, ratio_low, ratio_upp)
+print(ar_vs_facility)
+write_csv(ar_vs_facility, file.path(tab_dir, "ar_vs_facility.csv"))
 
-n_corrob <- sum(df_ind_corrob$diphtheria_corrob, na.rm = TRUE)
-died_corrob <- sum(df_ind_corrob$diphtheria_corrob & df_ind_corrob$died, na.rm = TRUE)
-n_corrob
-died_corrob / n_corrob
+# cases meeting the restricted definition
+df_ind |>
+  summarise(n_cases = sum(diphtheria, na.rm = TRUE), n_restricted = sum(diphtheria_corrob, na.rm = TRUE), pct = n_restricted / n_cases * 100)
 
-svyglm(diphtheria_corrob ~ vacc, family = quasibinomial, design = df_srvy_corrob) |>
+# vaccination and diphtheria under the restricted definition
+svyglm(diphtheria_corrob ~ vacc, family = quasibinomial, design = df_srvy_ind) |>
   broom::tidy(exponentiate = TRUE, conf.int = TRUE) |>
   filter(term == "vaccTRUE")
 
@@ -162,12 +207,12 @@ run_svy_logistic <- function(outcome, vars_uni, vars_multi, design_object) {
     filter(term != "(Intercept)") |>
     mutate(
       variable = case_when(
-        grepl("age_grp_diph", term) ~ "age_grp_diph",
-        grepl("sex", term) ~ "sex",
-        grepl("vacc", term) ~ "vacc",
-        grepl("ses_quintile", term) ~ "as.numeric(ses_quintile)",
-        grepl("^lga", term) ~ "lga",
-        TRUE ~ term
+        str_detect(term, "age_grp_diph") ~ "age_grp_diph",
+        str_detect(term, "sex") ~ "sex",
+        str_detect(term, "vacc") ~ "vacc",
+        str_detect(term, "ses_quintile") ~ "as.numeric(ses_quintile)",
+        str_detect(term, "^lga") ~ "lga",
+        .default = term
       )
     ) |>
     select(variable, term, multi_est = estimate, multi_low = conf.low, multi_high = conf.high, multi_p = p.value)
@@ -184,6 +229,10 @@ vars_table2 <- c("age_grp_diph", "sex", "vacc", "as.numeric(ses_quintile)", "hh_
 table_2 <- run_svy_logistic(outcome = "diphtheria", vars_uni = vars_table2, vars_multi = vars_table2, design_object = df_srvy_ind)
 print(table_2, n = Inf)
 write_csv(table_2, file.path(tab_dir, "table2_diphtheria_risk_factors.csv"))
+
+# complete-case samples: multivariable model, and the crude vaccination model
+length(svyglm(reformulate(vars_table2, "diphtheria"), family = quasibinomial, design = df_srvy_ind)$y)
+length(svyglm(diphtheria ~ vacc, family = quasibinomial, design = df_srvy_ind)$y)
 
 # ============================================================
 # 4. Mortality
@@ -202,6 +251,9 @@ calculate_mr(df_ind, died, TRUE)
 # under-5 mortality rate
 df_ind |> filter(age_grp %in% "0-4") |> calculate_mr(died, TRUE)
 
+# diphtheria-specific mortality rate (deaths attributed to diphtheria)
+calculate_mr(df_ind, died_diph_binary, TRUE)
+
 # leading causes of death, survey-weighted proportion of all deaths
 df_srvy_ind |>
   filter(died == TRUE) |>
@@ -209,26 +261,69 @@ df_srvy_ind |>
   summarise(pct = survey_mean(vartype = "ci") * 100) |>
   arrange(desc(pct))
 
-# overall CFR among diphtheria cases
-df_srvy_ind |> filter(diphtheria == TRUE) |> summarise(cfr = survey_mean(died * 100, vartype = "ci", na.rm = TRUE))
+# Case-fatality ratio (CFR) with survey CIs on the logit scale, which stay
+# within 0-100% when deaths are few
+cfr_ci <- function(des) {
+  ci <- svyciprop(~died, des, method = "logit")
+  tibble(
+    n_cases = nrow(des$variables), n_deaths = sum(des$variables$died, na.rm = TRUE),
+    cfr = 100 * as.numeric(coef(ci)), lower = 100 * confint(ci)[1, 1], upper = 100 * confint(ci)[1, 2]
+  )
+}
+des_cases <- subset(df_srvy_ind, diphtheria == TRUE)
+cfr_table <- bind_rows(
+  cfr_ci(des_cases) |> mutate(group = "Overall"),
+  cfr_ci(subset(des_cases, age_cat == "0-4")) |> mutate(group = "Under 5 years"),
+  cfr_ci(subset(des_cases, age_cat == "5+")) |> mutate(group = "5 years and over"),
+  cfr_ci(subset(df_srvy_ind, diphtheria_corrob %in% TRUE)) |> mutate(group = "Restricted case definition")
+) |>
+  select(group, n_cases, n_deaths, cfr, lower, upper)
+print(cfr_table)
+write_csv(cfr_table, file.path(tab_dir, "cfr_logit_ci.csv"))
 
-# CFR among children under 5
-df_srvy_ind |>
-  group_by(age_cat) |>
-  filter(diphtheria == TRUE) |>
-  summarise(cfr = survey_mean(died * 100, vartype = "ci", na.rm = TRUE)) |>
-  filter(age_cat == "0-4")
-
-# timing of diphtheria deaths relative to symptom onset
-df_ind |>
+# Timing of diphtheria deaths relative to symptom onset. Some records are
+# internally inconsistent: onset after the date of death, or a reported
+# care-seeking delay longer than the interval from onset to death.
+deaths_diph <-
+  df_ind |>
   filter(diphtheria == TRUE, died == TRUE, !is.na(date_died), !is.na(date_onset)) |>
-  mutate(days_onset_to_death = as.numeric(date_died - date_onset)) |>
-  summarise(n = n(), median_days = median(days_onset_to_death), q1 = quantile(days_onset_to_death, .25), q3 = quantile(days_onset_to_death, .75))
+  mutate(
+    days_onset_to_death = as.numeric(date_died - date_onset),
+    onset_after_death = days_onset_to_death < 0,
+    delay_exceeds_interval = delay_tx > days_onset_to_death,
+    inconsistent = onset_after_death %in% TRUE | delay_exceeds_interval %in% TRUE
+  )
+
+deaths_diph |>
+  summarise(
+    n = n(), median_days = median(days_onset_to_death), q1 = quantile(days_onset_to_death, .25), q3 = quantile(days_onset_to_death, .75),
+    n_onset_after_death = sum(onset_after_death), n_delay_exceeds_interval = sum(delay_exceeds_interval & !onset_after_death),
+    n_inconsistent = sum(inconsistent), median_days_consistent = median(days_onset_to_death[!inconsistent])
+  )
+
+# individuals with an inconsistent record, used for the sensitivity analysis in Section 5
+inconsistent_deaths <- deaths_diph |> filter(inconsistent) |> transmute(id = paste(index_hh, index_ind)) |> pull(id)
+
+# place of death, any cause (too few diphtheria-specific deaths for a
+# reliable estimate on their own)
+df_srvy_ind |>
+  filter(died == TRUE) |>
+  group_by(died_location) |>
+  summarise(pct = survey_mean(vartype = "ci") * 100)
+
+# care sought in the 2 weeks before death, all-cause deaths
+deaths_all <- df_ind |> filter(died %in% TRUE)
+deaths_all |> count(tx_seeking_hsb)
+deaths_all |> count(died_location, tx_seeking_hsb)
+
+# diphtheria deaths: place of death, care sought and where treated
+deaths_all |> filter(diphtheria %in% TRUE) |> count(died_location, tx_seeking, tx_location)
 
 # ============================================================
 # 5. Health-seeking behaviour and treatment delay
 # ============================================================
 
+df_ind |> filter(diphtheria == TRUE) |> count(tx_seeking)
 df_srvy_ind |> filter(diphtheria == TRUE) |> summarise(sought_care = survey_mean(tx_seeking == "Yes", vartype = "ci", na.rm = TRUE))
 
 df_ind |>
@@ -251,7 +346,41 @@ df_ind |>
 fit_delay_lp <- svyglm(died ~ delay_tx, family = gaussian, design = df_srvy_ind |> filter(diphtheria == TRUE))
 broom::tidy(fit_delay_lp, conf.int = TRUE) |> filter(term == "delay_tx") |> mutate(across(c(estimate, conf.low, conf.high), \(x) x * 100))
 
-# relative risk, dichotomised at >=4 days
+# risk of death among cases by treatment delay (>=4 vs <4 days)
+des_delay <- subset(df_srvy_ind, diphtheria %in% TRUE & !is.na(delay_tx_binary))
+delay_cfr <- bind_rows(
+  cfr_ci(subset(des_delay, delay_tx_binary == FALSE)) |> mutate(delay = "<4 days"),
+  cfr_ci(subset(des_delay, delay_tx_binary == TRUE)) |> mutate(delay = ">=4 days")
+) |>
+  select(delay, n_cases, n_deaths, cfr, lower, upper)
+print(delay_cfr)
+
+# risk ratio for >=4 vs <4 days (survey-weighted quasi-Poisson, log link)
+delay_risk_ratio <- function(des) {
+  fit <- svyglm(died ~ delay_tx_binary, family = quasipoisson(link = "log"), design = des)
+  tibble(
+    risk_ratio = exp(coef(fit)[["delay_tx_binaryTRUE"]]),
+    ci_low = exp(confint(fit)["delay_tx_binaryTRUE", 1]),
+    ci_high = exp(confint(fit)["delay_tx_binaryTRUE", 2]),
+    p = summary(fit)$coefficients["delay_tx_binaryTRUE", "Pr(>|t|)"]
+  )
+}
+
+# also without the deaths with inconsistent dates or delays
+bind_rows(
+  delay_risk_ratio(des_delay) |> mutate(records = "All cases with a recorded delay"),
+  delay_risk_ratio(subset(des_delay, !(paste(index_hh, index_ind) %in% inconsistent_deaths))) |>
+    mutate(records = "Excluding deaths with inconsistent dates or delays")
+)
+
+# ============================================================
+# 6. Vaccination and mortality
+# ============================================================
+# Exploratory: the timing of vaccination relative to illness or death is
+# unknown. Individuals with missing vaccination status are excluded.
+
+# Ratio of survey-weighted rates (events per person-day) between two groups,
+# with a delta-method CI on the log scale that treats the groups as independent.
 calculate_rate_ratio <- function(survey_design, numerator, denominator, group_var, grp_ref, grp_compare, scale_factor = 10000) {
   numerator <- rlang::enquo(numerator)
   denominator <- rlang::enquo(denominator)
@@ -273,40 +402,44 @@ calculate_rate_ratio <- function(survey_design, numerator, denominator, group_va
   )
 }
 
-calculate_rate_ratio(df_srvy_ind |> filter(diphtheria == TRUE), died, pt, delay_tx_binary, grp_ref = FALSE, grp_compare = TRUE)
+# mortality rate ratios, unvaccinated vs vaccinated (reference), whole surveyed
+# population; p-values are Wald z on the log scale, from the same SE as the CI
+rate_ratios <-
+  bind_rows(
+    calculate_rate_ratio(df_srvy_ind, died, pt, vacc, grp_ref = TRUE, grp_compare = FALSE) |> mutate(outcome = "All-cause"),
+    calculate_rate_ratio(df_srvy_ind, died_diph_binary, pt, vacc, grp_ref = TRUE, grp_compare = FALSE) |> mutate(outcome = "Diphtheria-attributed")
+  ) |>
+  mutate(p = 2 * pnorm(-abs(log(rate_ratio) / ((log(ci_high) - log(ci_low)) / (2 * 1.96))))) |>
+  select(outcome, everything())
+print(rate_ratios)
 
-# place of death, any cause (too few diphtheria-specific deaths for a
-# reliable estimate on their own)
-map(levels(df_ind$died_location), \(lvl) {
-  df_srvy_ind |>
-    summarise(pct = survey_mean(died_location == lvl, vartype = "ci", na.rm = TRUE) * 100) |>
-    mutate(died_location = lvl, .before = 1)
-}) |>
-  list_rbind()
+# events and person-days by vaccination status (missing status shown for
+# reference; those individuals are excluded from the ratios above)
+df_ind |>
+  group_by(vacc) |>
+  summarise(
+    n = n(), person_days = sum(pt, na.rm = TRUE),
+    deaths_all_cause = sum(died, na.rm = TRUE),
+    deaths_diphtheria = sum(died_diph_binary, na.rm = TRUE)
+  )
 
-# ============================================================
-# 6. Vaccination and mortality
-# ============================================================
+# all-cause rate ratio adjusted for age group (quasi-Poisson, person-time offset)
+fit_mrr_age <- svyglm(
+  died ~ unvacc + age_cat + offset(log(pt)), family = quasipoisson,
+  design = df_srvy_ind |> filter(!is.na(vacc), pt > 0) |> mutate(unvacc = !vacc)
+)
+exp(cbind(rr = coef(fit_mrr_age), confint(fit_mrr_age)))["unvaccTRUE", , drop = FALSE]
 
-# mortality rate ratio, unvaccinated as reference
-calculate_rate_ratio(df_srvy_ind, died, pt, vacc, grp_ref = FALSE, grp_compare = TRUE)
-
-# reciprocal (vaccinated as reference), for the E-value, which requires an
-# RR >= 1
-mrr_vacc <- calculate_rate_ratio(df_srvy_ind, died, pt, vacc, grp_ref = TRUE, grp_compare = FALSE)
-mrr_vacc
-evalues.RR(est = mrr_vacc$rate_ratio, lo = mrr_vacc$ci_low, hi = mrr_vacc$ci_high)
-
-# crude vaccine effectiveness = 1 - mortality rate ratio (vaccinated vs
-# unvaccinated)
-mrr_vs_unvacc <- calculate_rate_ratio(df_srvy_ind, died, pt, vacc, grp_ref = FALSE, grp_compare = TRUE)
-(1 - mrr_vs_unvacc$rate_ratio) * 100
-(1 - mrr_vs_unvacc$ci_high) * 100
-(1 - mrr_vs_unvacc$ci_low) * 100
-
-# CFR by vaccination status among cases
-df_srvy_ind |> filter(diphtheria == TRUE) |> group_by(vacc) |> summarise(cfr = survey_mean(died * 100, vartype = "ci", na.rm = TRUE))
-svyglm(died ~ vacc, family = quasibinomial, design = df_srvy_ind |> filter(diphtheria == TRUE)) |> broom::tidy()
+# CFR by vaccination status among cases, with a design-based test
+des_cases_v <- subset(des_cases, !is.na(vacc))
+cfr_by_vacc <- bind_rows(
+  cfr_ci(subset(des_cases_v, vacc == FALSE)) |> mutate(vacc = "Unvaccinated"),
+  cfr_ci(subset(des_cases_v, vacc == TRUE)) |> mutate(vacc = "Vaccinated")
+) |>
+  select(vacc, n_cases, n_deaths, cfr, lower, upper)
+print(cfr_by_vacc)
+svychisq(~ died + vacc, design = des_cases_v)
+write_csv(cfr_by_vacc, file.path(tab_dir, "cfr_by_vaccination.csv"))
 
 # ============================================================
 # 7. Vaccination and diphtheria: sensitivity analyses (Table 3)
@@ -321,8 +454,10 @@ extract_svyglm_or <- function(fit, term) {
   se_v <- sqrt(diag(vcov(fit)))
   est <- coef_v[[term]]
   se <- se_v[[term]]
+  # t distribution on the design degrees of freedom (as broom::tidy() in Table 2)
+  df_t <- fit$df.residual
   z <- est / se
-  tibble(or = exp(est), lower = exp(est - 1.96 * se), upper = exp(est + 1.96 * se), p = 2 * pnorm(-abs(z)))
+  tibble(or = exp(est), lower = exp(est - qt(0.975, df_t) * se), upper = exp(est + qt(0.975, df_t) * se), p = 2 * pt(-abs(z), df = df_t))
 }
 
 fit_t3_full <- svyglm(diphtheria ~ vacc, family = quasibinomial, design = df_srvy_ind)
@@ -356,25 +491,52 @@ df_ind |> filter(diphtheria == TRUE, vacc == TRUE) |> count(vacc_card == "Was va
 # ============================================================
 # 8. Vaccination coverage and campaign performance (Table 4)
 # ============================================================
+# Campaign-eligible children are those aged 6 months to 15 years (age_eligible).
 
-df_cc <- df_ind |> filter(age_eligible, vacc_source != "unknown", !is.na(vacc_epi_confirmed), !is.na(camp_confirmed))
-nrow(df_cc)
+df_ind |>
+  filter(age_eligible) |>
+  summarise(
+    n_eligible = n(),
+    n_status_missing = sum(is.na(vacc)),
+    n_reported_unvaccinated = sum(vacc == FALSE, na.rm = TRUE),
+    n_reported_vaccinated = sum(vacc == TRUE, na.rm = TRUE),
+    n_epi_status_known = sum(!is.na(vacc_epi_confirmed)),
+    n_camp_status_known = sum(!is.na(camp_confirmed)),
+    n_source_unknown = sum(vacc_source == "unknown", na.rm = TRUE),
+    pct_source_unknown = n_source_unknown / n_eligible * 100
+  )
 
-table_4 <-
-  df_cc |>
+# Vaccination evidence, and the Table 4 row each group falls in. Children with
+# missing status, or reported as vaccinated with no card and no campaign dose,
+# have no classifiable source and are excluded from Table 4.
+vacc_evidence <-
+  df_ind |>
+  filter(age_eligible) |>
   mutate(
-    epi_label = if_else(vacc_epi_confirmed, "EPI confirmed", "EPI not confirmed"),
-    camp_label = if_else(camp_confirmed, "Campaign confirmed", "Campaign not confirmed")
+    evidence = case_when(
+      vacc_card == "Yes" & is.na(vacc_epi_confirmed) ~ "Card seen, dated inside a campaign window",
+      vacc_card == "Yes" ~ "Card seen, dated outside campaign windows",
+      vacc_card == "Yes, but it is missing/lost" ~ "Reported vaccinated, card lost",
+      vacc_card == "Was vaccinated in the DTC/OPD/Contact clinic" ~ "Reported vaccinated at DTC/OPD/contact clinic",
+      vacc_card == "No" ~ "Vaccinated, no card",
+      vacc == FALSE ~ "Self-reported unvaccinated (card not asked)",
+      .default = "Vaccination status missing"
+    ),
+    table4_group = case_when(
+      is.na(vacc) ~ "Excluded: vaccination status missing",
+      vacc_source == "unknown" ~ "Excluded: source unclassifiable",
+      epi_t4 %in% TRUE ~ "Reported routine EPI vaccination",
+      .default = "No reported routine EPI vaccination"
+    )
   ) |>
-  count(epi_label, camp_label) |>
-  pivot_wider(names_from = camp_label, values_from = n, values_fill = 0L)
-print(table_4)
-write_csv(table_4, file.path(tab_dir, "table4_epi_vs_campaign.csv"))
+  count(evidence, table4_group) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+print(vacc_evidence)
+write_csv(vacc_evidence, file.path(tab_dir, "vaccination_evidence.csv"))
 
-svy_derived <- df_srvy_ind
-
-# survey-weighted routine EPI / campaign coverage, among all age-eligible children
-svy_derived |>
+# survey-weighted routine EPI / campaign coverage, among age-eligible children
+# with the status observed
+df_srvy_ind |>
   filter(age_eligible) |>
   summarise(
     epi_coverage = survey_mean(vacc_epi_confirmed == TRUE, vartype = "ci", na.rm = TRUE),
@@ -382,25 +544,62 @@ svy_derived |>
   )
 
 # evidence of vaccination from at least one source, among children with
-# a resolved vaccination source (Metric 4)
-svy_derived |>
+# a classified vaccination source
+df_srvy_ind |>
   filter(age_eligible, vacc_source != "unknown") |>
   summarise(any_source = survey_mean(vacc_source %in% c("both", "epi_only", "camp_only"), vartype = "ci", na.rm = TRUE))
 
-# no vaccination of any kind, among all age-eligible children with
-# self-reported vaccination status observed (Metric 3; vacc is already
-# logical, so it's used directly rather than re-deriving vacc_log)
-svy_derived |>
+# no vaccination of any kind, among age-eligible children with
+# self-reported vaccination status observed
+df_srvy_ind |>
   filter(age_eligible, !is.na(vacc)) |>
-  summarise(none = survey_mean(vacc == FALSE, vartype = "ci", na.rm = TRUE))
+  summarise(n = unweighted(n()), none = survey_mean(vacc == FALSE, vartype = "ci", na.rm = TRUE))
 
-# Metric 1: % of campaign recipients with prior card-confirmed EPI
-svy_derived |> filter(age_eligible, camp_confirmed == TRUE) |> summarise(est = survey_mean(vacc_epi_confirmed == TRUE, vartype = "ci", na.rm = TRUE))
+# Table 4: reported routine EPI vaccination against campaign vaccination, among
+# children with a classified vaccination source (counts unweighted, row
+# percentages of campaign-vaccinated)
+df_cc <- df_ind |> filter(age_eligible, vacc_source != "unknown", !is.na(epi_t4), !is.na(camp_confirmed))
+nrow(df_cc)
 
-# Metric 2: % of EPI-unvaccinated children reached by the campaign
-svy_derived |>
-  filter(age_eligible, vacc_epi_confirmed == FALSE, !is.na(camp_confirmed)) |>
-  summarise(est = survey_mean(camp_confirmed == TRUE, vartype = "ci", na.rm = TRUE))
+table_4 <-
+  df_cc |>
+  mutate(
+    epi_label = factor(epi_t4, levels = c(TRUE, FALSE), labels = c("Reported routine EPI vaccination", "No reported routine EPI vaccination")),
+    camp_label = if_else(camp_confirmed, "Campaign confirmed", "Campaign not confirmed")
+  ) |>
+  count(epi_label, camp_label) |>
+  pivot_wider(names_from = camp_label, values_from = n, values_fill = 0L)
+table_4 <-
+  table_4 |>
+  bind_rows(table_4 |> summarise(epi_label = "Total", across(where(is.numeric), sum))) |>
+  mutate(total = `Campaign confirmed` + `Campaign not confirmed`, pct_campaign = `Campaign confirmed` / total * 100)
+print(table_4)
+write_csv(table_4, file.path(tab_dir, "table4_epi_vs_campaign.csv"))
+
+# design-based (Rao-Scott) test of routine EPI status against campaign status
+des_cc <- df_srvy_ind |> filter(age_eligible, vacc_source != "unknown", !is.na(epi_t4), !is.na(camp_confirmed))
+svychisq(~ epi_t4 + camp_confirmed, design = des_cc)
+
+# survey-weighted: campaign recipients with reported routine EPI vaccination
+df_srvy_ind |> filter(age_eligible, camp_confirmed == TRUE) |> summarise(epi_among_campaign = survey_mean(epi_t4 == TRUE, vartype = "ci", na.rm = TRUE))
+
+# survey-weighted: children without reported routine EPI vaccination who
+# received a campaign dose
+des_cc |>
+  filter(epi_t4 == FALSE) |>
+  summarise(campaign_among_no_epi = survey_mean(camp_confirmed == TRUE, vartype = "ci", na.rm = TRUE))
+
+# Reported vaccination by whether the household respondent believes that
+# vaccination protects against disease: counts, then the odds ratio adjusted for
+# sex, age group and SES quintile
+df_ind |>
+  filter(!is.na(vacc), !is.na(vacc_belief_protect)) |>
+  group_by(vacc_belief_protect) |>
+  summarise(n = n(), n_vaccinated = sum(vacc), pct = n_vaccinated / n * 100)
+
+svyglm(vacc ~ sex + age_grp_diph + vacc_belief_protect + ses_quintile, family = quasibinomial, design = df_srvy_ind) |>
+  broom::tidy(exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term == "vacc_belief_protectYes")
 
 # ============================================================
 # 9. Figure 1: epidemic curve
@@ -417,18 +616,19 @@ df_epi <-
   arrange(date_onset) |>
   mutate(month_ym = format(date_onset, "%b %Y") |> fct_inorder())
 
-df_epi |>
-  ggplot(aes(month_ym, n, fill = lga)) +
-  geom_col(width = 1, colour = "black") +
+figure_1 <-
+  df_epi |>
+  ggplot(aes(month_ym, n)) +
+  # One colour-blind-safe fill for all LGAs; the facet strips name the LGA
+  geom_col(width = 1, colour = "black", fill = "#4575b4") +
   facet_wrap(~lga, ncol = 1, strip.position = "right") +
   scale_x_discrete(labels = function(x) gsub(" ", "\n", x), expand = c(0, 0)) +
-  scale_fill_manual(values = cols_zone, guide = "none") +
   scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
   labs(x = "Month of disease onset", y = "Number of individuals") +
   theme_classic(base_size = 11) +
   theme(strip.background = element_rect(fill = "grey90", colour = NA), strip.text = element_text(face = "bold"))
 
-ggsave(file.path(fig_dir, "figure1_epicurve.jpg"), width = 12, height = 8, dpi = 300)
+ggsave(file.path(fig_dir, "figure1_epicurve.jpg"), figure_1, width = 12, height = 8, dpi = 300)
 
 # ============================================================
 # 10. Spatial figures (Figure 2, S1 Figure) and cluster-level
@@ -615,56 +815,6 @@ spatial_correlations <- pmap_dfr(whole_pop_pairs, spearman_test)
 print(spatial_correlations, n = Inf)
 write_csv(spatial_correlations, file.path(tab_dir, "spatial_correlations.csv"))
 
-# age-restricted checks (campaign-eligible and under-5 populations), cited
-# in Limitations as holding under any population restriction tried
-tbl_cluster_eligible <-
-  df_ind_maps |>
-  filter(!is.na(cluster), age_eligible %in% TRUE) |>
-  group_by(cluster) |>
-  summarise(
-    num_ppl_eligible = n(),
-    attack_rate_eligible = sum(diphtheria %in% TRUE, na.rm = TRUE) / n() * 100,
-    mr_eligible = sum(died %in% TRUE, na.rm = TRUE) / sum(pt, na.rm = TRUE) * 10000
-  )
-
-tbl_cluster_u5_ar <-
-  df_ind_maps |>
-  filter(!is.na(cluster), age_grp %in% "0-4") |>
-  group_by(cluster) |>
-  summarise(attack_rate_u5 = sum(diphtheria %in% TRUE, na.rm = TRUE) / n() * 100)
-
-tbl_cluster_raw_restricted <-
-  tbl_cluster_raw |>
-  select(cluster, vacc_epi, vacc_camp, vacc_any) |>
-  left_join(tbl_cluster_eligible, by = "cluster") |>
-  left_join(tbl_cluster_u5, by = "cluster") |>
-  left_join(tbl_cluster_u5_ar, by = "cluster")
-
-spearman_restricted <- function(x_col, y_col, label) {
-  test <- cor.test(tbl_cluster_raw_restricted[[x_col]], tbl_cluster_raw_restricted[[y_col]], use = "complete.obs", method = "spearman")
-  tibble(pair = label, rho = unname(test$estimate), p = test$p.value)
-}
-
-restricted_pairs <- tribble(
-  ~x_col,      ~y_col,                 ~label,
-  "vacc_epi",  "attack_rate_eligible", "EPI coverage vs attack rate (campaign-eligible)",
-  "vacc_camp", "attack_rate_eligible", "Campaign coverage vs attack rate (campaign-eligible)",
-  "vacc_any",  "attack_rate_eligible", "Vaccinated (any) vs attack rate (campaign-eligible)",
-  "vacc_epi",  "mr_eligible",          "EPI coverage vs mortality (campaign-eligible)",
-  "vacc_camp", "mr_eligible",          "Campaign coverage vs mortality (campaign-eligible)",
-  "vacc_any",  "mr_eligible",          "Vaccinated (any) vs mortality (campaign-eligible)",
-  "vacc_epi",  "attack_rate_u5",       "EPI coverage vs attack rate (under-5)",
-  "vacc_camp", "attack_rate_u5",       "Campaign coverage vs attack rate (under-5)",
-  "vacc_any",  "attack_rate_u5",       "Vaccinated (any) vs attack rate (under-5)",
-  "vacc_epi",  "u5mr",                 "EPI coverage vs mortality (under-5)",
-  "vacc_camp", "u5mr",                 "Campaign coverage vs mortality (under-5)",
-  "vacc_any",  "u5mr",                 "Vaccinated (any) vs mortality (under-5)"
-)
-
-spatial_correlations_restricted <- pmap_dfr(restricted_pairs, spearman_restricted)
-print(spatial_correlations_restricted, n = Inf)
-write_csv(spatial_correlations_restricted, file.path(tab_dir, "spatial_correlations_age_restricted.csv"))
-
 # Figure 2: EPI vs campaign coverage, shared colour scale, one collected
 # legend below the panels
 epi_raw <- plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_epi", "num_ppl_vacc", "Vaccination coverage (%)", high_is_bad = FALSE)
@@ -691,3 +841,25 @@ s1_figure <-
   plot_layout(ncol = 3)
 
 ggsave(file.path(fig_dir, "S1_figure_vaccination_ar_u5mr.jpg"), s1_figure, height = 6, width = 20)
+
+# PLOS-ready Figure 1 (TIFF, LZW, 300 dpi, 7.5 in wide, Arial 8-10 pt), drawn at
+# final size from the epicurve above.
+plos_fig_dir <- file.path(fig_dir, "plos")
+dir.create(plos_fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+plos_theme <-
+  theme(
+    text = element_text(family = "Arial", size = 9),
+    plot.title = element_text(family = "Arial", size = 10, face = "plain"),
+    axis.text = element_text(family = "Arial", size = 8),
+    axis.title = element_text(family = "Arial", size = 9),
+    legend.text = element_text(family = "Arial", size = 8),
+    legend.title = element_text(family = "Arial", size = 9),
+    strip.text = element_text(family = "Arial", size = 9)
+  )
+
+ggsave(
+  file.path(plos_fig_dir, "Fig1.tif"), figure_1 + plos_theme,
+  device = ragg::agg_tiff, compression = "lzw",
+  width = 7.5, height = 5.5, units = "in", dpi = 300, bg = "white"
+)
