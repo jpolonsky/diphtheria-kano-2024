@@ -26,7 +26,7 @@ dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 # ============================================================
 # df_ind: one row per surveyed individual (n=7,998), unweighted - used for
 #   raw counts (Table 1) and as the basis for the survey design below
-# df_hh: one row per approached household (n=1,083) - used for the
+# df_hh (data/df_hh_srvy.rds): one row per approached household (n=1,083) - used for the
 #   response-rate figure
 # map_boundaries: LGA and study-area boundary polygons, used only by the
 #   spatial figures at the end of this script
@@ -37,7 +37,7 @@ df_ind <- read_rds("data/df_ind.rds") |>
     diphtheria_corrob = diphtheria == TRUE & diagnosis == "Yes",
     card_chr = as.character(vacc_card)
   )
-df_hh <- read_rds("data/df_hh.rds")
+df_hh <- read_rds("data/df_hh_srvy.rds")
 maps <- read_rds("data/map_boundaries.rds")
 map_nga_ward <- maps$map_nga_ward
 map_nga_ward_union <- maps$map_nga_ward_union

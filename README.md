@@ -28,7 +28,7 @@ output/
 Each results script (`hbc_results.R`, `srvy_results.R`) expects to be run from the repository root, with R (version 4.3 or later) and the packages listed at the top of the script installed, and its required input files in place under `data/` (see Data access below). Running a script writes all figures and tables under `output/`.
 
 - `hbc_results.R` reads `data/df_pt.rds`, `data/df_cohort_samp.rds`, `data/df_hh.rds`.
-- `srvy_results.R` reads `data/df_ind.rds`, `data/df_hh.rds`, `data/map_boundaries.rds`.
+- `srvy_results.R` reads `data/df_ind.rds`, `data/df_hh_srvy.rds`, `data/map_boundaries.rds`.
 
 `hbc_prep.R` and `srvy_prep.R` are included for transparency: they document exactly how those files are derived from the study team's internal data store, but they read from paths internal to that data store and will not run outside it.
 

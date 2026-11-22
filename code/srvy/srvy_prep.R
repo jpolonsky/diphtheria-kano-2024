@@ -1,5 +1,5 @@
 # Builds the de-identified analysis-ready files srvy_results.R reads
-# (data/df_ind.rds, data/df_hh.rds, data/map_boundaries.rds) from this
+# (data/df_ind.rds, data/df_hh_srvy.rds, data/map_boundaries.rds) from this
 # project's internal raw Kobo pull.
 # Not part of the public release itself - run once internally, then
 # share the resulting rds files under the MSF data access process
@@ -324,13 +324,13 @@ df_hh_public <-
 
 dir.create(here("code/public_release/data"), showWarnings = FALSE, recursive = TRUE)
 write_rds(df_ind_public, here("code/public_release/data/df_ind.rds"))
-write_rds(df_hh_public, here("code/public_release/data/df_hh.rds"))
+write_rds(df_hh_public, here("code/public_release/data/df_hh_srvy.rds"))
 write_rds(
   list(map_nga_ward = map_nga_ward, map_nga_ward_union = map_nga_ward_union),
   here("code/public_release/data/map_boundaries.rds")
 )
 
 cat(sprintf(
-  "Wrote df_ind (%d rows), df_hh (%d rows), map_boundaries.rds to code/public_release/data/\n",
+  "Wrote df_ind (%d rows), df_hh_srvy (%d rows), map_boundaries.rds to code/public_release/data/\n",
   nrow(df_ind_public), nrow(df_hh_public)
 ))
