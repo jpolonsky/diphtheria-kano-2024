@@ -33,13 +33,9 @@ dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 
 df_ind <- read_rds("data/df_ind.rds") |>
   mutate(
-    # Table 4 EPI status: a card dated inside a campaign window (vacc_epi_confirmed
-    # NA, vacc_source camp_only) counts as a campaign dose, not a routine one, so
-    # those children sit in the "No reported routine EPI vaccination" row and
-    # Table 4 holds all 3,287 children with a classified vaccination source.
-    epi_t4 = if_else(is.na(vacc_epi_confirmed) & vacc_source == "camp_only", FALSE, vacc_epi_confirmed),
     # restricted case definition: cases also reported as diagnosed by a health professional
-    diphtheria_corrob = diphtheria == TRUE & diagnosis == "Yes"
+    diphtheria_corrob = diphtheria == TRUE & diagnosis == "Yes",
+    card_chr = as.character(vacc_card)
   )
 df_hh <- read_rds("data/df_hh.rds")
 maps <- read_rds("data/map_boundaries.rds")
@@ -48,10 +44,34 @@ map_nga_ward_union <- maps$map_nga_ward_union
 
 options(survey.lonely.psu = "adjust")
 
-df_srvy_ind <-
+# Design strata: eight clusters have households in two LGAs, but each cluster
+# was sampled once, from one LGA, so each cluster is assigned to the LGA
+# holding most of its households (lga_samp). The 78 clusters are the primary
+# sampling units; weights stay on each household's own LGA.
+lga_samp_lookup <-
   df_ind |>
-  filter(!is.na(cluster), !is.na(index_hh)) |>
-  as_survey(ids = c(cluster, index_hh), strata = lga, weights = weight, nest = TRUE)
+  filter(!is.na(cluster)) |>
+  distinct(cluster, index_hh, lga) |>
+  count(cluster, lga) |>
+  slice_max(n, n = 1, by = cluster, with_ties = FALSE) |>
+  select(cluster, lga_samp = lga)
+
+df_ind <- df_ind |> left_join(lga_samp_lookup, by = "cluster")
+stopifnot(
+  n_distinct(df_ind$cluster[!is.na(df_ind$cluster)]) == 78,
+  n_distinct(paste(df_ind$lga_samp, df_ind$cluster)[!is.na(df_ind$cluster)]) == 78
+)
+
+# two-stage design (cluster, then household within cluster), stratified by
+# lga_samp; no finite population correction
+as_kano_design <- function(data) {
+  data |>
+    filter(!is.na(cluster), !is.na(index_hh)) |>
+    as_survey(ids = c(cluster, index_hh), strata = lga_samp, weights = weight, nest = TRUE)
+}
+
+df_srvy_ind <- as_kano_design(df_ind)
+design_df <- degf(df_srvy_ind)
 
 # ============================================================
 # 1. Participants (Table 1)
@@ -76,8 +96,11 @@ flow_counts <- tibble(
 print(flow_counts)
 write_csv(flow_counts, file.path(tab_dir, "flow_counts.csv"))
 
-# enrolled households, clusters, and LGA-by-cluster units (the primary sampling units)
-df_ind |> summarise(n_households = n_distinct(index_hh), n_clusters = n_distinct(cluster), n_lga_clusters = n_distinct(paste(lga, cluster)))
+# enrolled households and clusters (the primary sampling units), clusters per
+# design stratum, and the design degrees of freedom
+df_ind |> summarise(n_households = n_distinct(index_hh), n_clusters = n_distinct(cluster))
+lga_samp_lookup |> count(lga_samp, name = "n_clusters")
+design_df
 
 df_ind |>
   summarise(
@@ -120,11 +143,11 @@ write_csv(table_1_p, file.path(tab_dir, "table1_pvalues.csv"))
 df_srvy_ind |>
   summarise(attack_rate = survey_mean(diphtheria * 100, vartype = "ci", deff = TRUE, na.rm = TRUE))
 
-# incidence rate per 1,000 person-years (case count / total person-time)
-df_srvy_ind |>
-  summarise(
-    ir = survey_ratio(numerator = diphtheria * 1000 * 365.25, denominator = pt, vartype = "ci", na.rm = TRUE)
-  )
+# incidence rate, reported cases per 1,000 person-years (ratio estimator over
+# person-time pt in days; missing diphtheria status dropped from both terms),
+# t CI on the design df
+inc_ratio <- svyratio(~ as.numeric(diphtheria), ~ I(pt / 365.25 / 1000), design = df_srvy_ind, na.rm = TRUE)
+c(ir = coef(inc_ratio)[[1]], confint(inc_ratio, df = design_df)[1, ])
 
 df_srvy_ind |>
   group_by(age_grp_diph) |>
@@ -141,7 +164,7 @@ svyttest(diphtheria ~ sex, design = df_srvy_ind)
 # members
 hh_summary <-
   df_ind |>
-  group_by(index_hh, cluster, lga, weight) |>
+  group_by(index_hh, cluster, lga, lga_samp, weight) |>
   summarise(hh_size = n(), num_cases = sum(diphtheria, na.rm = TRUE), .groups = "drop") |>
   filter(num_cases > 0) |>
   mutate(secondary_cases = pmax(num_cases - 1, 0), exposed = pmax(hh_size - 1, 0), sar = secondary_cases / exposed)
@@ -149,7 +172,7 @@ hh_summary <-
 nrow(hh_summary)
 sum(hh_summary$num_cases >= 2)
 
-hh_design <- hh_summary |> as_survey(ids = c(cluster, index_hh), strata = lga, weights = weight, nest = TRUE)
+hh_design <- as_kano_design(hh_summary)
 hh_design |> summarise(SAR = survey_mean(sar * 100, vartype = "ci", deff = TRUE, na.rm = TRUE))
 
 # Facility comparator for the same four LGAs: 9,864 residents notified at the
@@ -240,8 +263,7 @@ length(svyglm(diphtheria ~ vacc, family = quasibinomial, design = df_srvy_ind)$y
 
 calculate_mr <- function(data, key, value) {
   data |>
-    filter(!is.na(cluster), !is.na(index_hh)) |>
-    as_survey(ids = c(cluster, index_hh), strata = lga, weights = weight, nest = TRUE) |>
+    as_kano_design() |>
     summarise(mr = survey_ratio(numerator = {{ key }} %in% {{ value }} * 10000, denominator = pt, vartype = "ci", deff = TRUE, na.rm = TRUE))
 }
 
@@ -305,11 +327,14 @@ deaths_diph |>
 inconsistent_deaths <- deaths_diph |> filter(inconsistent) |> transmute(id = paste(index_hh, index_ind)) |> pull(id)
 
 # place of death, any cause (too few diphtheria-specific deaths for a
-# reliable estimate on their own)
+# reliable estimate on their own), among deaths with a recorded place
 df_srvy_ind |>
-  filter(died == TRUE) |>
-  group_by(died_location) |>
-  summarise(pct = survey_mean(vartype = "ci") * 100)
+  summarise(
+    died_home = survey_mean(died_location == "At home", vartype = "ci", na.rm = TRUE),
+    died_facility = survey_mean(died_location == "At health facility", vartype = "ci", na.rm = TRUE),
+    died_transit = survey_mean(died_location == "In transit to health facility", vartype = "ci", na.rm = TRUE)
+  ) |>
+  print(width = Inf)
 
 # care sought in the 2 weeks before death, all-cause deaths
 deaths_all <- df_ind |> filter(died %in% TRUE)
@@ -380,38 +405,43 @@ bind_rows(
 # unknown. Individuals with missing vaccination status are excluded.
 
 # Ratio of survey-weighted rates (events per person-day) between two groups,
-# with a delta-method CI on the log scale that treats the groups as independent.
+# from a survey-weighted quasi-Poisson model with a log person-time offset,
+# fitted on the two groups together. Both rates come from the same clusters,
+# so their covariance is carried by the design-based variance instead of
+# being assumed zero. The point estimate equals the ratio of the two weighted
+# rates; CI and p-value are t-based on the model's residual df. Rates are
+# returned per scale_factor person-days.
 calculate_rate_ratio <- function(survey_design, numerator, denominator, group_var, grp_ref, grp_compare, scale_factor = 10000) {
-  numerator <- rlang::enquo(numerator)
-  denominator <- rlang::enquo(denominator)
-  group_var <- rlang::enquo(group_var)
-  survey_design$variables <- survey_design$variables |> mutate(group = !!group_var)
-  rates <-
-    survey_design |>
-    group_by(group) |>
-    summarise(mr = survey_ratio(numerator = (!!numerator) * scale_factor, denominator = !!denominator, vartype = c("se", "ci"), na.rm = TRUE)) |>
-    ungroup()
-  rate1 <- rates |> filter(group == grp_compare) |> pull(mr)
-  se1 <- rates |> filter(group == grp_compare) |> pull(mr_se)
-  rate2 <- rates |> filter(group == grp_ref) |> pull(mr)
-  se2 <- rates |> filter(group == grp_ref) |> pull(mr_se)
+  survey_design$variables <-
+    survey_design$variables |>
+    mutate(group = {{ group_var }}, .rr_num = as.numeric({{ numerator }}), .rr_den = {{ denominator }})
+  des <- subset(survey_design, group %in% c(grp_ref, grp_compare) & !is.na(.rr_num) & !is.na(.rr_den) & .rr_den > 0)
+  des$variables$.rr_cmp <- as.numeric(des$variables$group == grp_compare)
+  fit <- svyglm(.rr_num ~ .rr_cmp + offset(log(.rr_den)), family = quasipoisson(link = "log"), design = des)
+  est <- coef(fit)[[".rr_cmp"]]
+  se <- sqrt(vcov(fit)[".rr_cmp", ".rr_cmp"])
+  df_t <- fit$df.residual
+  rates <- svyby(~ I(.rr_num * scale_factor), ~group, denominator = ~.rr_den, design = des, FUN = svyratio)
   tibble(
-    rate_ratio = rate1 / rate2,
-    ci_low = exp(log(rate1 / rate2) - 1.96 * sqrt((se1 / rate1)^2 + (se2 / rate2)^2)),
-    ci_high = exp(log(rate1 / rate2) + 1.96 * sqrt((se1 / rate1)^2 + (se2 / rate2)^2))
+    rate_ratio = exp(est),
+    ci_low = exp(est - qt(0.975, df_t) * se),
+    ci_high = exp(est + qt(0.975, df_t) * se),
+    p = 2 * pt(abs(est / se), df_t, lower.tail = FALSE),
+    rate_compare = coef(rates)[[as.character(grp_compare)]],
+    rate_ref = coef(rates)[[as.character(grp_ref)]]
   )
 }
 
 # mortality rate ratios, unvaccinated vs vaccinated (reference), whole surveyed
-# population; p-values are Wald z on the log scale, from the same SE as the CI
+# population
 rate_ratios <-
   bind_rows(
     calculate_rate_ratio(df_srvy_ind, died, pt, vacc, grp_ref = TRUE, grp_compare = FALSE) |> mutate(outcome = "All-cause"),
     calculate_rate_ratio(df_srvy_ind, died_diph_binary, pt, vacc, grp_ref = TRUE, grp_compare = FALSE) |> mutate(outcome = "Diphtheria-attributed")
   ) |>
-  mutate(p = 2 * pnorm(-abs(log(rate_ratio) / ((log(ci_high) - log(ci_low)) / (2 * 1.96))))) |>
   select(outcome, everything())
-print(rate_ratios)
+print(rate_ratios, width = Inf)
+write_csv(rate_ratios, file.path(tab_dir, "mortality_rate_ratios.csv"))
 
 # events and person-days by vaccination status (missing status shown for
 # reference; those individuals are excluded from the ratios above)
@@ -444,10 +474,15 @@ write_csv(cfr_by_vacc, file.path(tab_dir, "cfr_by_vaccination.csv"))
 # ============================================================
 # 7. Vaccination and diphtheria: sensitivity analyses (Table 3)
 # ============================================================
-# The comparator for every restricted analysis below is explicit
-# self-report-unvaccinated (vacc == FALSE), not a derived binary's own
-# FALSE category - e.g. vacc_epi_binary == FALSE means "reports
-# vaccinated but no card evidence", not "unvaccinated".
+# Crude survey-weighted ORs, each vaccinated group against individuals
+# reported as never vaccinated. Row 1 covers all ages. Rows 2-4 use
+# categories the questionnaire records, among individuals under 16 at
+# interview (the campaign question was asked only below 16), and do not
+# overlap: individuals vaccinated at a DTC, OPD or contact clinic (doses given
+# on presentation under the outbreak-response protocol) form row 4 whatever
+# their campaign answer and are left out of rows 2 and 3. Each row is a
+# domain of the full design; CIs and p-values use each model's residual df,
+# as in Table 2.
 
 extract_svyglm_or <- function(fit, term) {
   coef_v <- coef(fit)
@@ -460,28 +495,44 @@ extract_svyglm_or <- function(fit, term) {
   tibble(or = exp(est), lower = exp(est - qt(0.975, df_t) * se), upper = exp(est + qt(0.975, df_t) * se), p = 2 * pt(-abs(z), df = df_t))
 }
 
-fit_t3_full <- svyglm(diphtheria ~ vacc, family = quasibinomial, design = df_srvy_ind)
-res_t3_full <- extract_svyglm_or(fit_t3_full, "vaccTRUE") |> mutate(analysis = "Full sample (all respondents)")
+svy_t3 <-
+  df_ind |>
+  mutate(
+    t3_group = case_when(
+      vacc %in% FALSE ~ "never",
+      vacc %in% TRUE & card_chr %in% "Was vaccinated in the DTC/OPD/Contact clinic" ~ "clinic",
+      vacc %in% TRUE & vacc_camp_binary %in% TRUE ~ "campaign",
+      vacc %in% TRUE & vacc_camp_binary %in% FALSE ~ "not_campaign",
+      .default = NA
+    ),
+    t3_clinic = vacc %in% TRUE & card_chr %in% "Was vaccinated in the DTC/OPD/Contact clinic",
+    t3_u16 = age < 16
+  ) |>
+  as_kano_design()
 
-d_t3_card <- df_ind |> filter(vacc_epi_binary == TRUE | vacc == FALSE, !is.na(diphtheria)) |> mutate(card_vs_unvacc = vacc_epi_binary == TRUE)
-svy_t3_card <- svydesign(ids = ~ cluster + index_hh, strata = ~lga, weights = ~weight, data = d_t3_card, nest = TRUE)
-fit_t3_card <- svyglm(diphtheria ~ card_vs_unvacc, family = quasibinomial, design = svy_t3_card)
-res_t3_card <- extract_svyglm_or(fit_t3_card, "card_vs_unvaccTRUE") |> mutate(analysis = "Card-confirmed vaccination only")
+t3_row <- function(des, exposed, label) {
+  d <- des |> mutate(.x = {{ exposed }}) |> filter(!is.na(.x), !is.na(diphtheria))
+  fit <- svyglm(diphtheria ~ .x, family = quasibinomial, design = d)
+  dat <- d$variables
+  extract_svyglm_or(fit, ".xTRUE") |>
+    mutate(
+      analysis = label,
+      n_exposed = sum(dat$.x), cases_exposed = sum(dat$diphtheria[dat$.x]),
+      n_never = sum(!dat$.x), cases_never = sum(dat$diphtheria[!dat$.x])
+    )
+}
 
-d_t3_routine <- df_ind |>
-  mutate(routine_only = vacc_epi_binary == TRUE & (vacc_camp_binary == FALSE | is.na(vacc_camp_binary))) |>
-  filter(routine_only == TRUE | vacc == FALSE, !is.na(diphtheria))
-svy_t3_routine <- svydesign(ids = ~ cluster + index_hh, strata = ~lga, weights = ~weight, data = d_t3_routine, nest = TRUE)
-fit_t3_routine <- svyglm(diphtheria ~ routine_only, family = quasibinomial, design = svy_t3_routine)
-res_t3_routine <- extract_svyglm_or(fit_t3_routine, "routine_onlyTRUE") |> mutate(analysis = "Routine vaccination only vs unvaccinated")
+svy_t3_u16 <- svy_t3 |> filter(t3_u16 %in% TRUE)
 
-d_t3_camp <- df_ind |> filter(vacc_camp_binary == TRUE | vacc == FALSE, !is.na(diphtheria)) |> mutate(camp_vs_unvacc = vacc_camp_binary == TRUE)
-svy_t3_camp <- svydesign(ids = ~ cluster + index_hh, strata = ~lga, weights = ~weight, data = d_t3_camp, nest = TRUE)
-fit_t3_camp <- svyglm(diphtheria ~ camp_vs_unvacc, family = quasibinomial, design = svy_t3_camp)
-res_t3_camp <- extract_svyglm_or(fit_t3_camp, "camp_vs_unvaccTRUE") |> mutate(analysis = "Any campaign vaccination vs unvaccinated")
-
-table_3 <- bind_rows(res_t3_full, res_t3_card, res_t3_routine, res_t3_camp) |> select(analysis, or, lower, upper, p)
-print(table_3)
+table_3 <-
+  bind_rows(
+    t3_row(svy_t3, vacc, "Ever vaccinated, all ages"),
+    t3_row(svy_t3_u16 |> filter(t3_group %in% c("campaign", "never")), t3_group == "campaign", "Campaign dose reported (no clinic dose), under 16"),
+    t3_row(svy_t3_u16 |> filter(t3_group %in% c("not_campaign", "never")), t3_group == "not_campaign", "Vaccinated, no campaign or clinic dose reported, under 16"),
+    t3_row(svy_t3_u16 |> filter(t3_clinic | vacc %in% FALSE), t3_clinic, "Vaccinated at a DTC, OPD or contact clinic, under 16")
+  ) |>
+  select(analysis, n_exposed, cases_exposed, n_never, cases_never, or, lower, upper, p)
+print(table_3, width = Inf)
 write_csv(table_3, file.path(tab_dir, "table3_vaccination_sensitivity.csv"))
 
 # among vaccinated cases, how many reported vaccination at a care contact
@@ -489,105 +540,167 @@ write_csv(table_3, file.path(tab_dir, "table3_vaccination_sensitivity.csv"))
 df_ind |> filter(diphtheria == TRUE, vacc == TRUE) |> count(vacc_card == "Was vaccinated in the DTC/OPD/Contact clinic")
 
 # ============================================================
-# 8. Vaccination coverage and campaign performance (Table 4)
+# 8. Vaccination coverage and campaign performance (Table 4, S3 Table)
 # ============================================================
-# Campaign-eligible children are those aged 6 months to 15 years (age_eligible).
+# Only what the questionnaire records is used. The card question records
+# documentation (card seen, card lost, no card, or a dose given at a DTC, OPD
+# or contact clinic), not where a dose came from, and the card date is the
+# most recent vaccination of any kind, so no routine EPI status is derived
+# and card dates classify nothing. Campaign status is the caregiver's answer
+# alone, among children reported as vaccinated. On the first survey day the
+# campaign question was also put to never-vaccinated children; those answers
+# are not used, and never-vaccinated children stay never vaccinated.
+#
+# Campaign-eligible children: within the campaigns' target ages (6 weeks to
+# 14 years) during at least one campaign phase, i.e. aged 6 weeks or more by
+# the end of the last phase and 14 completed years or younger at the start of
+# the first, and 15 completed years or younger at interview (age_eligible),
+# because the campaign question was asked only below 16.
 
-df_ind |>
-  filter(age_eligible) |>
-  summarise(
-    n_eligible = n(),
-    n_status_missing = sum(is.na(vacc)),
-    n_reported_unvaccinated = sum(vacc == FALSE, na.rm = TRUE),
-    n_reported_vaccinated = sum(vacc == TRUE, na.rm = TRUE),
-    n_epi_status_known = sum(!is.na(vacc_epi_confirmed)),
-    n_camp_status_known = sum(!is.na(camp_confirmed)),
-    n_source_unknown = sum(vacc_source == "unknown", na.rm = TRUE),
-    pct_source_unknown = n_source_unknown / n_eligible * 100
-  )
+phases <- tribble(
+  ~round, ~start,                ~end,
+  "r1",   as.Date("2023-03-01"), as.Date("2023-04-30"),
+  "r2",   as.Date("2023-08-01"), as.Date("2023-10-31"),
+  "r3",   as.Date("2023-11-01"), as.Date("2024-01-31")
+)
+camp_age_min <- 6 / 52 # years
+camp_age_max <- 14     # completed years, so exact age below camp_age_max + 1
+q_age_max <- 15        # campaign question asked only below 16 at interview
+camp_start <- min(phases$start)
+camp_end <- max(phases$end)
 
-# Vaccination evidence, and the Table 4 row each group falls in. Children with
-# missing status, or reported as vaccinated with no card and no campaign dose,
-# have no classifiable source and are excluded from Table 4.
-vacc_evidence <-
+hist_levels <- c(
+  "Reported never vaccinated", "Card seen", "Card reported lost",
+  "Reported vaccinated, no card", "Vaccinated at a DTC, OPD or contact clinic",
+  "Vaccination status missing"
+)
+
+df_vacc <-
   df_ind |>
-  filter(age_eligible) |>
   mutate(
-    evidence = case_when(
-      vacc_card == "Yes" & is.na(vacc_epi_confirmed) ~ "Card seen, dated inside a campaign window",
-      vacc_card == "Yes" ~ "Card seen, dated outside campaign windows",
-      vacc_card == "Yes, but it is missing/lost" ~ "Reported vaccinated, card lost",
-      vacc_card == "Was vaccinated in the DTC/OPD/Contact clinic" ~ "Reported vaccinated at DTC/OPD/contact clinic",
-      vacc_card == "No" ~ "Vaccinated, no card",
-      vacc == FALSE ~ "Self-reported unvaccinated (card not asked)",
+    # exact age at interview, taking the midpoint of the completed unit (`age`
+    # is in years for records entered in months too)
+    age_exact = if_else(age_unit == "Month", age + 0.5 / 12, age + 0.5),
+    age_at_camp_end = age_exact - as.numeric(date_int - camp_end) / 365.25,
+    age_at_camp_start = age_exact - as.numeric(date_int - camp_start) / 365.25,
+    elig_camp = age_at_camp_end >= camp_age_min & age_at_camp_start < camp_age_max + 1 & age_eligible,
+    # within the target ages during the campaigns but aged past 15 by the
+    # interview: not classifiable, as the campaign question was not asked
+    aged_out = age_at_camp_start < camp_age_max + 1 & age > q_age_max,
+    history = factor(case_when(
+      vacc %in% FALSE ~ "Reported never vaccinated",
+      card_chr %in% "Yes" ~ "Card seen",
+      card_chr %in% "Yes, but it is missing/lost" ~ "Card reported lost",
+      card_chr %in% "No" ~ "Reported vaccinated, no card",
+      card_chr %in% "Was vaccinated in the DTC/OPD/Contact clinic" ~ "Vaccinated at a DTC, OPD or contact clinic",
       .default = "Vaccination status missing"
+    ), levels = hist_levels),
+    camp_rep = if_else(vacc %in% TRUE, vacc_camp_binary, NA),
+    camp_lbl = case_when(
+      vacc %in% FALSE ~ "Not applicable (never vaccinated)",
+      camp_rep %in% TRUE ~ "Campaign dose reported",
+      camp_rep %in% FALSE ~ "No campaign dose reported",
+      .default = "Campaign answer missing"
     ),
-    table4_group = case_when(
-      is.na(vacc) ~ "Excluded: vaccination status missing",
-      vacc_source == "unknown" ~ "Excluded: source unclassifiable",
-      epi_t4 %in% TRUE ~ "Reported routine EPI vaccination",
-      .default = "No reported routine EPI vaccination"
+    # three mutually exclusive groups for coverage; NA when unknown
+    status3 = case_when(
+      vacc %in% FALSE ~ "Reported never vaccinated",
+      camp_rep %in% TRUE ~ "Campaign dose reported",
+      camp_rep %in% FALSE ~ "Vaccinated, no campaign dose reported",
+      .default = NA
     )
-  ) |>
-  count(evidence, table4_group) |>
-  mutate(pct = round(100 * n / sum(n), 1))
-print(vacc_evidence)
-write_csv(vacc_evidence, file.path(tab_dir, "vaccination_evidence.csv"))
+  )
+stopifnot(!any(is.na(df_vacc$elig_camp) & df_vacc$age_eligible %in% TRUE))
 
-# survey-weighted routine EPI / campaign coverage, among age-eligible children
-# with the status observed
-df_srvy_ind |>
-  filter(age_eligible) |>
+# campaign-eligible children; children aged 15 or younger at interview who
+# were too young or too old during the campaigns; children within the target
+# ages during the campaigns but aged 16 or more at interview
+df_vacc |>
   summarise(
-    epi_coverage = survey_mean(vacc_epi_confirmed == TRUE, vartype = "ci", na.rm = TRUE),
-    camp_coverage = survey_mean(camp_confirmed == TRUE, vartype = "ci", na.rm = TRUE)
+    n_eligible = sum(elig_camp, na.rm = TRUE),
+    n_age_eligible_not_at_campaigns = sum(age_eligible & !elig_camp, na.rm = TRUE),
+    n_aged_out = sum(aged_out, na.rm = TRUE)
   )
 
-# evidence of vaccination from at least one source, among children with
-# a classified vaccination source
-df_srvy_ind |>
-  filter(age_eligible, vacc_source != "unknown") |>
-  summarise(any_source = survey_mean(vacc_source %in% c("both", "epi_only", "camp_only"), vartype = "ci", na.rm = TRUE))
+des_vacc <- as_kano_design(df_vacc)
+des_vacc_el <- des_vacc |> filter(elig_camp %in% TRUE)
 
-# no vaccination of any kind, among age-eligible children with
-# self-reported vaccination status observed
-df_srvy_ind |>
-  filter(age_eligible, !is.na(vacc)) |>
-  summarise(n = unweighted(n()), none = survey_mean(vacc == FALSE, vartype = "ci", na.rm = TRUE))
+# Survey-weighted proportion with a logit CI on the full design's df (srvyr's
+# survey_mean ignores df = on a filtered design, so svyciprop is called)
+ciprop <- function(des, var) {
+  p <- svyciprop(var, design = des, method = "logit", df = design_df)
+  tibble(est = as.numeric(p), est_low = attr(p, "ci")[[1]], est_upp = attr(p, "ci")[[2]])
+}
 
-# Table 4: reported routine EPI vaccination against campaign vaccination, among
-# children with a classified vaccination source (counts unweighted, row
-# percentages of campaign-vaccinated)
-df_cc <- df_ind |> filter(age_eligible, vacc_source != "unknown", !is.na(epi_t4), !is.na(camp_confirmed))
-nrow(df_cc)
+# Coverage: three mutually exclusive groups on one denominator, campaign-
+# eligible children whose vaccination status, and campaign answer if
+# vaccinated, are recorded
+des_vacc_s3 <- des_vacc_el |> filter(!is.na(status3))
+coverage <-
+  c("Reported never vaccinated", "Campaign dose reported", "Vaccinated, no campaign dose reported") |>
+  map_dfr(\(g) {
+    ciprop(des_vacc_s3 |> mutate(.g = status3 == g), ~.g) |>
+      mutate(indicator = g, n = sum(des_vacc_s3$variables$status3 == g), .before = 1)
+  }) |>
+  mutate(N = sum(n), n_unknown = sum(df_vacc$elig_camp %in% TRUE & is.na(df_vacc$status3)))
+stopifnot(abs(sum(coverage$est) - 1) < 1e-8)
+print(coverage, width = Inf)
+write_csv(coverage, file.path(tab_dir, "coverage_campaign_eligible.csv"))
 
-table_4 <-
-  df_cc |>
-  mutate(
-    epi_label = factor(epi_t4, levels = c(TRUE, FALSE), labels = c("Reported routine EPI vaccination", "No reported routine EPI vaccination")),
-    camp_label = if_else(camp_confirmed, "Campaign confirmed", "Campaign not confirmed")
+# Table 4: recorded vaccination history by the caregiver's campaign answer
+# (counts unweighted), with the survey-weighted % reporting a campaign dose
+# among vaccinated children with an answer
+table_4_counts <-
+  df_vacc |>
+  filter(elig_camp %in% TRUE) |>
+  count(history, camp_lbl) |>
+  pivot_wider(names_from = camp_lbl, values_from = n, values_fill = 0) |>
+  mutate(Total = rowSums(across(where(is.numeric))))
+
+des_vacc_camp <- des_vacc_el |> filter(vacc %in% TRUE, !is.na(camp_rep))
+table_4_pct <-
+  bind_rows(
+    map_dfr(hist_levels[2:5], \(h) ciprop(des_vacc_camp |> filter(history == h), ~camp_rep) |> mutate(history = h)),
+    ciprop(des_vacc_camp, ~camp_rep) |> mutate(history = "All reported vaccinated")
   ) |>
-  count(epi_label, camp_label) |>
-  pivot_wider(names_from = camp_label, values_from = n, values_fill = 0L)
+  rename(pct_camp = est, pct_camp_low = est_low, pct_camp_upp = est_upp)
+
 table_4 <-
-  table_4 |>
-  bind_rows(table_4 |> summarise(epi_label = "Total", across(where(is.numeric), sum))) |>
-  mutate(total = `Campaign confirmed` + `Campaign not confirmed`, pct_campaign = `Campaign confirmed` / total * 100)
-print(table_4)
-write_csv(table_4, file.path(tab_dir, "table4_epi_vs_campaign.csv"))
+  table_4_counts |>
+  mutate(history = as.character(history)) |>
+  bind_rows(
+    table_4_counts |>
+      filter(!history %in% c("Reported never vaccinated", "Vaccination status missing")) |>
+      summarise(history = "All reported vaccinated", across(where(is.numeric), sum))
+  ) |>
+  left_join(table_4_pct, by = "history")
+stopifnot(sum(table_4_counts$Total) == sum(df_vacc$elig_camp, na.rm = TRUE))
+print(as.data.frame(table_4))
+write_csv(table_4, file.path(tab_dir, "table4_vaccination_history_campaign.csv"))
 
-# design-based (Rao-Scott) test of routine EPI status against campaign status
-des_cc <- df_srvy_ind |> filter(age_eligible, vacc_source != "unknown", !is.na(epi_t4), !is.na(camp_confirmed))
-svychisq(~ epi_t4 + camp_confirmed, design = des_cc)
+# Table 4 footnote: campaign answers given outside the skip logic (never
+# vaccinated, or vaccination status missing), by interview date; not used
+df_vacc |>
+  filter(elig_camp %in% TRUE, !(vacc %in% TRUE), !is.na(vacc_camp)) |>
+  count(history, date_int, vacc_camp = as.character(vacc_camp))
 
-# survey-weighted: campaign recipients with reported routine EPI vaccination
-df_srvy_ind |> filter(age_eligible, camp_confirmed == TRUE) |> summarise(epi_among_campaign = survey_mean(epi_t4 == TRUE, vartype = "ci", na.rm = TRUE))
-
-# survey-weighted: children without reported routine EPI vaccination who
-# received a campaign dose
-des_cc |>
-  filter(epi_t4 == FALSE) |>
-  summarise(campaign_among_no_epi = survey_mean(camp_confirmed == TRUE, vartype = "ci", na.rm = TRUE))
+# S3 Table: main reason given for no campaign dose (vaccinated eligible
+# children whose caregiver answered No); unweighted counts and survey-weighted
+# %, logit CI on the design df
+des_vacc_no <-
+  des_vacc_el |>
+  filter(camp_rep %in% FALSE) |>
+  mutate(reason = coalesce(as.character(vacc_no_reason_001), "Reason missing"))
+s3_table <-
+  des_vacc_no$variables |>
+  count(reason, sort = TRUE) |>
+  pull(reason) |>
+  map_dfr(\(r) {
+    ciprop(des_vacc_no |> mutate(.r = reason == r), ~.r) |>
+      mutate(reason = r, n = sum(des_vacc_no$variables$reason == r), N = nrow(des_vacc_no$variables), .before = 1)
+  })
+print(as.data.frame(s3_table), digits = 3)
+write_csv(s3_table, file.path(tab_dir, "S3_table_no_campaign_reasons.csv"))
 
 # Reported vaccination by whether the household respondent believes that
 # vaccination protects against disease: counts, then the odds ratio adjusted for
@@ -638,16 +751,20 @@ ggsave(file.path(fig_dir, "figure1_epicurve.jpg"), figure_1, width = 12, height 
 # value before kernel-smoothing, since raw small-cluster rates would
 # otherwise produce spurious hotspots; the formal correlation tests
 # below use the raw (unshrunk) cluster estimates instead, so shrinkage
-# doesn't artificially inflate them.
+# doesn't artificially inflate them. Vaccination indicators are on the
+# campaign-eligible population (Section 8), as shares of children whose
+# status is recorded: campaign dose reported, vaccinated with no campaign
+# dose reported, and never vaccinated sum to 100% in every cluster; ever
+# vaccinated is among children with a recorded vaccination status.
 
-df_ind_maps <-
-  df_ind |>
+df_vacc_map <-
+  df_vacc |>
+  filter(!is.na(cluster), elig_camp %in% TRUE) |>
   mutate(
-    vacc_any_binary = case_when(
-      vacc_source %in% c("both", "epi_only", "camp_only") ~ TRUE,
-      vacc_source == "neither" ~ FALSE,
-      .default = NA
-    )
+    cov_camp_i = if_else(is.na(status3), NA, status3 == "Campaign dose reported"),
+    cov_notcamp_i = if_else(is.na(status3), NA, status3 == "Vaccinated, no campaign dose reported"),
+    cov_never_i = if_else(is.na(status3), NA, status3 == "Reported never vaccinated"),
+    cov_ever_i = vacc
   )
 
 shrink_binom <- function(dat, outcome) {
@@ -673,7 +790,7 @@ shrink_rate <- function(dat, outcome) {
 }
 
 tbl_cluster_core <-
-  df_ind_maps |>
+  df_ind |>
   filter(!is.na(cluster)) |>
   group_by(cluster) |>
   summarise(
@@ -686,26 +803,24 @@ tbl_cluster_core <-
   )
 
 tbl_cluster_u5 <-
-  df_ind_maps |>
+  df_ind |>
   filter(!is.na(cluster), age_grp %in% "0-4") |>
   group_by(cluster) |>
   summarise(num_ppl_u5 = n(), died_u5_n = sum(died %in% TRUE, na.rm = TRUE), pt_u5_tot = sum(pt, na.rm = TRUE), u5mr = died_u5_n / pt_u5_tot * 10000)
 
 tbl_cluster_vacc <-
-  df_ind_maps |>
-  filter(!is.na(cluster), age_eligible %in% TRUE) |>
+  df_vacc_map |>
   group_by(cluster) |>
   summarise(
     num_ppl_vacc = n(),
-    vacc_epi = sum(vacc_epi_confirmed %in% TRUE, na.rm = TRUE) / sum(!is.na(vacc_epi_confirmed)) * 100,
-    vacc_camp = sum(camp_confirmed %in% TRUE, na.rm = TRUE) / sum(!is.na(camp_confirmed)) * 100,
-    vacc_any_n = sum(vacc_source %in% c("both", "epi_only", "camp_only")),
-    vacc_any_d = sum(vacc_source %in% c("both", "epi_only", "camp_only", "neither")),
-    vacc_any = vacc_any_n / vacc_any_d * 100
-  ) |>
-  select(-vacc_any_n, -vacc_any_d)
+    cov_camp = mean(cov_camp_i, na.rm = TRUE) * 100,
+    cov_notcamp = mean(cov_notcamp_i, na.rm = TRUE) * 100,
+    cov_never = mean(cov_never_i, na.rm = TRUE) * 100,
+    cov_ever = mean(cov_ever_i, na.rm = TRUE) * 100
+  )
 
-tbl_cluster <- tbl_cluster_core |> full_join(tbl_cluster_u5, by = "cluster") |> full_join(tbl_cluster_vacc, by = "cluster")
+tbl_cluster <- tbl_cluster_core |> full_join(tbl_cluster_u5, by = "cluster") |> left_join(tbl_cluster_vacc, by = "cluster")
+stopifnot(nrow(tbl_cluster) == 78)
 
 # unshrunk, for the Spearman correlations below
 tbl_cluster_raw <- tbl_cluster
@@ -715,20 +830,19 @@ apply_shrinkage <- function(tbl, raw_col, shrunk_tbl) {
   tbl |> left_join(shrunk_tbl, by = "cluster") |> mutate("{raw_col}" := coalesce(shrunk, .data[[raw_col]])) |> select(-shrunk)
 }
 
-df_ind_vacc <- df_ind_maps |> filter(age_eligible %in% TRUE)
-df_ind_u5 <- df_ind_maps |> filter(age_grp %in% "0-4")
+df_ind_u5 <- df_ind |> filter(age_grp %in% "0-4")
 
 tbl_cluster <-
   tbl_cluster |>
-  apply_shrinkage("attack_rate", shrink_binom(df_ind_maps, diphtheria)) |>
-  apply_shrinkage("mr", shrink_rate(df_ind_maps, died)) |>
+  apply_shrinkage("attack_rate", shrink_binom(df_ind, diphtheria)) |>
+  apply_shrinkage("mr", shrink_rate(df_ind, died)) |>
   apply_shrinkage("u5mr", shrink_rate(df_ind_u5, died)) |>
-  apply_shrinkage("vacc_epi", shrink_binom(df_ind_vacc, vacc_epi_confirmed)) |>
-  apply_shrinkage("vacc_camp", shrink_binom(df_ind_vacc, camp_confirmed)) |>
-  apply_shrinkage("vacc_any", shrink_binom(df_ind_vacc, vacc_any_binary))
+  apply_shrinkage("cov_camp", shrink_binom(df_vacc_map, cov_camp_i)) |>
+  apply_shrinkage("cov_notcamp", shrink_binom(df_vacc_map, cov_notcamp_i)) |>
+  apply_shrinkage("cov_never", shrink_binom(df_vacc_map, cov_never_i))
 
 tbl_cluster_gps <-
-  df_ind_maps |>
+  df_ind |>
   filter(!is.na(cluster), !is.na(lat), !is.na(lon)) |>
   group_by(cluster) |>
   slice(1) |>
@@ -744,12 +858,34 @@ tbl_cluster <-
 shp_boundary <- map_nga_ward_union |> st_transform(3857)
 shp_lga <- map_nga_ward |> st_transform(3857)
 
+# cluster-level correlation tests, raw (unshrunk) cluster estimates: each
+# vaccination indicator against the attack rate, all-cause and under-5
+# mortality (never vaccinated gives the ever-vaccinated values with the sign
+# reversed, so it is not tested separately)
+spearman_test <- function(x_col, y_col, label) {
+  test <- suppressWarnings(cor.test(tbl_cluster_raw[[x_col]], tbl_cluster_raw[[y_col]], method = "spearman"))
+  tibble(pair = label, rho = unname(test$estimate), p = test$p.value)
+}
+
+spearman_pairs <- tribble(
+  ~x_col,        ~y_col,        ~label,
+  "cov_ever",    "attack_rate", "Ever vaccinated vs diphtheria attack rate",
+  "cov_ever",    "mr",          "Ever vaccinated vs all-cause mortality",
+  "cov_ever",    "u5mr",        "Ever vaccinated vs under-5 mortality",
+  "cov_notcamp", "attack_rate", "Vaccinated, no campaign dose vs diphtheria attack rate",
+  "cov_notcamp", "u5mr",        "Vaccinated, no campaign dose vs under-5 mortality",
+  "cov_camp",    "attack_rate", "Campaign dose reported vs diphtheria attack rate",
+  "cov_camp",    "u5mr",        "Campaign dose reported vs under-5 mortality"
+)
+
+spatial_correlations <- pmap_dfr(spearman_pairs, spearman_test)
+print(spatial_correlations, n = Inf)
+write_csv(spatial_correlations, file.path(tab_dir, "spatial_correlations.csv"))
+
 # indicator: column in tbl_cluster; weight_col: cluster-N column used to
-# weight the smoothing; high_is_bad: colour direction (TRUE = high value
-# red/bad, e.g. attack rate; FALSE = high value green/good, e.g.
-# vaccination coverage); scale_max lets two maps share a colour ceiling
-# for a single collected legend.
-plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, high_is_bad = TRUE, scale_max = NULL) {
+# weight the smoothing. Viridis throughout (begin/end trim the extremes so
+# contour labels stay legible); direction = -1 makes high values dark.
+plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, direction = 1, begin = 0.15, end = 0.97) {
   poly_win <- as.owin(shp)
   filtered_dat <- dat |> filter(!is.na(.data[[indicator]]))
   ppp_xy <- st_coordinates(filtered_dat) |> as_tibble()
@@ -770,83 +906,72 @@ plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, high_is_
     mutate(lon = st_coordinates(st_centroid(geometry))[, 1], lat = st_coordinates(st_centroid(geometry))[, 2]) |>
     st_drop_geometry()
 
-  own_max <- max(grid_points$v, na.rm = TRUE)
-  max_value <- if (!is.null(scale_max)) scale_max else own_max
-
-  plot <-
-    ggplot() +
+  ggplot() +
     geom_sf(data = sm_dat, aes(fill = v), colour = NA) +
     geom_sf(data = st_boundary(shp_lga), colour = "grey40", linewidth = 0.4) +
     geom_sf(data = st_boundary(shp), colour = "black", linewidth = 0.8) +
     geom_contour(data = grid_points, aes(x = lon, y = lat, z = v), colour = "grey20", linewidth = 0.3, linetype = "dashed") +
     metR::geom_text_contour(data = grid_points, aes(x = lon, y = lat, z = v), colour = "black", size = 3, skip = 0, stroke = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = legend_name, limits = c(0, max_value)) +
+    scale_fill_viridis_c(
+      option = "viridis", direction = direction, begin = begin, end = end,
+      name = legend_name, limits = c(0, max(grid_points$v, na.rm = TRUE))
+    ) +
     coord_sf(crs = st_crs(shp)) +
     theme_void()
-
-  lst(plot, max_value = own_max)
 }
 
-maps_srvy <- list(
-  attack_rate = plot_ppp_srvy(tbl_cluster, shp_boundary, "attack_rate", "num_ppl", "Diphtheria attack rate (%)")$plot,
-  u5mr = plot_ppp_srvy(tbl_cluster, shp_boundary, "u5mr", "num_ppl_u5", "Under-5 mortality rate\n(per 10,000 person-days)")$plot,
-  vacc_any = plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_any", "num_ppl_vacc", "Vaccination coverage - any\n(EPI and/or campaign) (%)", high_is_bad = FALSE)$plot
-)
-
-# cluster-level correlation tests, raw (unshrunk) cluster estimates
-spearman_test <- function(x_col, y_col, label) {
-  test <- cor.test(tbl_cluster_raw[[x_col]], tbl_cluster_raw[[y_col]], use = "complete.obs", method = "spearman")
-  tibble(pair = label, rho = unname(test$estimate), p = test$p.value)
-}
-
-whole_pop_pairs <- tribble(
-  ~x_col,      ~y_col,        ~label,
-  "vacc_epi",  "vacc_camp",   "EPI vs campaign coverage",
-  "vacc_any",  "mr",          "Vaccinated (any) vs all-cause mortality",
-  "vacc_any",  "u5mr",        "Vaccinated (any) vs under-5 mortality",
-  "vacc_any",  "attack_rate", "Vaccinated (any) vs diphtheria attack rate",
-  "vacc_epi",  "attack_rate", "EPI coverage vs attack rate",
-  "vacc_camp", "attack_rate", "Campaign coverage vs attack rate",
-  "vacc_epi",  "u5mr",        "EPI coverage vs under-5 mortality",
-  "vacc_camp", "u5mr",        "Campaign coverage vs under-5 mortality"
-)
-
-spatial_correlations <- pmap_dfr(whole_pop_pairs, spearman_test)
-print(spatial_correlations, n = Inf)
-write_csv(spatial_correlations, file.path(tab_dir, "spatial_correlations.csv"))
-
-# Figure 2: EPI vs campaign coverage, shared colour scale, one collected
-# legend below the panels
-epi_raw <- plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_epi", "num_ppl_vacc", "Vaccination coverage (%)", high_is_bad = FALSE)
-camp_raw <- plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_camp", "num_ppl_vacc", "Vaccination coverage (%)", high_is_bad = FALSE)
-epi_camp_shared_max <- max(epi_raw$max_value, camp_raw$max_value)
-
-epi_shared <- plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_epi", "num_ppl_vacc", "Vaccination coverage (%)", high_is_bad = FALSE, scale_max = epi_camp_shared_max)$plot
-camp_shared <- plot_ppp_srvy(tbl_cluster, shp_boundary, "vacc_camp", "num_ppl_vacc", "Vaccination coverage (%)", high_is_bad = FALSE, scale_max = epi_camp_shared_max)$plot
-
-figure_2 <-
-  (epi_shared + labs(title = "a. Routine EPI coverage")) +
-  (camp_shared + labs(title = "b. Campaign coverage")) +
-  plot_layout(ncol = 2, guides = "collect") &
-  theme(legend.position = "bottom")
-
-ggsave(file.path(fig_dir, "figure2_vaccination_coverage.jpg"), figure_2, height = 6.5, width = 12)
-
-# S1 Figure: vaccinated (any), attack rate, under-5 mortality - different
-# units, so each panel keeps its own colour scale
-s1_figure <-
-  (maps_srvy$vacc_any + labs(title = "a. Vaccinated (any)")) +
-  (maps_srvy$attack_rate + labs(title = "b. Diphtheria attack rate")) +
-  (maps_srvy$u5mr + labs(title = "c. Under-5 mortality")) +
-  plot_layout(ncol = 3)
-
-ggsave(file.path(fig_dir, "S1_figure_vaccination_ar_u5mr.jpg"), s1_figure, height = 6, width = 20)
-
-# PLOS-ready Figure 1 (TIFF, LZW, 300 dpi, 7.5 in wide, Arial 8-10 pt), drawn at
-# final size from the epicurve above.
+# PLOS-ready figures: TIFF, LZW, 300 dpi, 7.5 in wide, Arial 8-10 pt, no title
+# inside the figure file
 plos_fig_dir <- file.path(fig_dir, "plos")
 dir.create(plos_fig_dir, showWarnings = FALSE, recursive = TRUE)
 
+map_theme <-
+  theme(
+    legend.position = "bottom", text = element_text(family = "Arial", size = 9),
+    plot.title = element_text(family = "Arial", size = 10, face = "bold"),
+    legend.text = element_text(family = "Arial", size = 8),
+    legend.title = element_text(family = "Arial", size = 8)
+  )
+
+save_plos_tif <- function(plot, file, height) {
+  ggsave(file.path(plos_fig_dir, file), plot, device = ragg::agg_tiff, compression = "lzw", width = 7.5, height = height, units = "in", dpi = 300, bg = "white")
+}
+
+# Figure 2: the three mutually exclusive vaccination groups among
+# campaign-eligible children, each panel on its own scale; darker always
+# means less vaccinated (the two vaccinated groups run dark = low, never
+# vaccinated dark = high)
+fig2_panel <- \(ind, lab, direction) {
+  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, "num_ppl_vacc", lab, direction = direction) +
+    guides(fill = guide_colourbar(title.position = "top", barwidth = unit(4.2, "cm"), barheight = unit(0.3, "cm")))
+}
+figure_2 <-
+  (fig2_panel("cov_camp", "Campaign dose reported (%)", 1) + labs(title = "a")) +
+  (fig2_panel("cov_notcamp", "Vaccinated, no campaign dose (%)", 1) + labs(title = "b")) +
+  (fig2_panel("cov_never", "Never vaccinated (%)", -1) + labs(title = "c")) +
+  plot_layout(ncol = 3) &
+  map_theme
+
+ggsave(file.path(fig_dir, "figure2_vaccination_coverage.jpg"), figure_2, width = 7.5, height = 3.3, units = "in", dpi = 300, bg = "white")
+save_plos_tif(figure_2, "Fig2.tif", height = 3.3)
+
+# S1 Figure: diphtheria attack rate and under-5 mortality, each panel on its
+# own scale, darker = higher. No vaccination panel: ever vaccinated is 100%
+# minus Figure 2c.
+s1_panel <- \(ind, w, lab) {
+  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, w, lab, direction = -1) +
+    guides(fill = guide_colourbar(title.position = "top", barwidth = unit(5.5, "cm"), barheight = unit(0.3, "cm")))
+}
+s1_figure <-
+  (s1_panel("attack_rate", "num_ppl", "Diphtheria attack rate (%)") + labs(title = "a")) +
+  (s1_panel("u5mr", "num_ppl_u5", "Under-5 mortality rate (per 10,000 person-days)") + labs(title = "b")) +
+  plot_layout(ncol = 2) &
+  map_theme
+
+ggsave(file.path(fig_dir, "S1_figure_attack_rate_u5mr.jpg"), s1_figure, width = 7.5, height = 3.9, units = "in", dpi = 300, bg = "white")
+save_plos_tif(s1_figure, "S1_Fig.tif", height = 3.9)
+
+# PLOS-ready Figure 1, drawn at final size from the epicurve above
 plos_theme <-
   theme(
     text = element_text(family = "Arial", size = 9),
@@ -858,8 +983,4 @@ plos_theme <-
     strip.text = element_text(family = "Arial", size = 9)
   )
 
-ggsave(
-  file.path(plos_fig_dir, "Fig1.tif"), figure_1 + plos_theme,
-  device = ragg::agg_tiff, compression = "lzw",
-  width = 7.5, height = 5.5, units = "in", dpi = 300, bg = "white"
-)
+save_plos_tif(figure_1 + plos_theme, "Fig1.tif", height = 5.5)

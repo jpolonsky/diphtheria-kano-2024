@@ -1,6 +1,6 @@
-# Builds the de-identified analysis-ready files srvy_results.R and
-# srvy_maps_public.R read (data/df_ind.rds, data/df_hh.rds,
-# data/map_boundaries.rds) from this project's internal raw Kobo pull.
+# Builds the de-identified analysis-ready files srvy_results.R reads
+# (data/df_ind.rds, data/df_hh.rds, data/map_boundaries.rds) from this
+# project's internal raw Kobo pull.
 # Not part of the public release itself - run once internally, then
 # share the resulting rds files under the MSF data access process
 # described in the README.
@@ -104,28 +104,17 @@ df_ind <-
         .default = NA_real_
       ),
     # vacc/vacc_pre coerced to logical FIRST, before anything downstream
-    # compares them to FALSE/TRUE - reordering this fixed a real bug (see
-    # CLAUDE.md "Key analytical decisions", SUPERSEDED 2026-08-11) where
-    # vacc_camp_binary/vacc_epi_binary silently never matched self-report-
-    # unvaccinated individuals, because the comparison ran against the
-    # still-uncoerced Kobo factor.
+    # compares them to FALSE/TRUE: comparing against the still-uncoerced
+    # Kobo factor made vacc_camp_binary silently never match
+    # self-report-unvaccinated individuals.
     vacc = vacc |> case_match("No" ~ FALSE, "Yes" ~ TRUE, .default = NA),
     vacc_pre = vacc_pre |> case_match("No" ~ FALSE, "Yes" ~ TRUE, .default = NA),
-    vacc_epi_binary = case_when(
-      vacc == FALSE ~ FALSE,
-      vacc_card == "No" ~ FALSE,
-      vacc_card %in% c("Yes", "Yes, but it is missing/lost", "Was vaccinated in the DTC/OPD/Contact clinic") ~ TRUE,
-      .default = NA
-    ),
+    # the caregiver's answer to the campaign question (srvy_results.R uses it
+    # only for children reported as vaccinated)
     vacc_camp_binary = case_when(
       vacc == FALSE ~ FALSE,
       vacc_camp == "No" ~ FALSE,
       vacc_camp |> str_detect("Yes") ~ TRUE,
-      .default = NA
-    ),
-    vacc_ever = case_when(
-      vacc_epi_binary == TRUE | vacc_camp_binary == TRUE ~ TRUE,
-      vacc_epi_binary == FALSE & vacc_camp_binary == FALSE ~ FALSE,
       .default = NA
     ),
     diphtheria = case_when(
@@ -301,84 +290,27 @@ df_ind <-
   left_join(df_ses, by = ".row") |>
   select(-.row)
 
-# ---- Vaccination source triangulation (routine EPI vs campaign), used
-# for Tables 3-4 and the coverage maps ----
-
-coerce_logical <- function(x) {
-  if (is.logical(x)) return(x)
-  x_chr <- as.character(x)
-  case_when(
-    is.na(x_chr) ~ NA,
-    x_chr %in% c("TRUE", "True", "true", "T", "Yes", "YES", "Y", "Yes (card observed)",
-                 "Yes (card not observed)", "Yes (card)", "Yes, but it is missing/lost",
-                 "Was vaccinated in the DTC/OPD/Contact clinic") ~ TRUE,
-    x_chr %in% c("FALSE", "False", "false", "F", "No", "NO", "N") ~ FALSE,
-    .default = NA
-  )
-}
-
-in_any_phase <- function(date_vec, phases) {
-  map_lgl(date_vec, \(d) {
-    if (is.na(d)) return(NA)
-    any(d >= phases$start & d <= phases$end, na.rm = TRUE)
-  })
-}
-
-phases <- tribble(
-  ~round, ~start,                ~end,
-  "r1",   as.Date("2023-03-01"), as.Date("2023-04-30"),
-  "r2",   as.Date("2023-08-01"), as.Date("2023-10-31"),
-  "r3",   as.Date("2023-11-01"), as.Date("2024-01-31")
-)
+# ---- Age at interview within the campaign question's age range ----
+# `age` is already in years for records entered in months (converted
+# above), so it is not divided by 12 again here. srvy_results.R combines
+# age_eligible with age at the campaigns (from age, age_unit and
+# date_int) to define the campaign-eligible population.
 
 df_ind <-
   df_ind |>
   mutate(
-    age_yrs = if_else(age_unit == "Month", as.numeric(age) / 12, as.numeric(age)),
-    age_eligible = age_yrs >= 0.5 & age_yrs <= 15,
-    vacc_log = coerce_logical(vacc),
-    card_chr = as.character(vacc_card),
-    card_present = card_chr %in% c("Yes", "Yes, but it is missing/lost", "Was vaccinated in the DTC/OPD/Contact clinic"),
-    card_no = card_chr == "No",
-    vacc_date = as.Date(date_vacc_card),
-    date_in_campaign = in_any_phase(vacc_date, phases),
-    vacc_epi_confirmed = case_when(
-      card_present & (is.na(date_in_campaign) | !date_in_campaign) ~ TRUE,
-      card_present & date_in_campaign ~ NA,
-      card_no ~ FALSE,
-      vacc_log == FALSE ~ FALSE,
-      .default = NA
-    ),
-    camp_binary_flag = if_else(!is.na(vacc_camp_binary), as.logical(vacc_camp_binary), NA),
-    camp_date_flag = date_in_campaign,
-    camp_text_flag = if_else(
-      !is.na(vacc_camp) & str_detect(as.character(vacc_camp), regex("round|campaign|mass|mop-up", ignore_case = TRUE)),
-      TRUE, NA
-    ),
-    camp_confirmed = case_when(
-      (camp_binary_flag == TRUE) | (camp_date_flag == TRUE) | (camp_text_flag == TRUE) ~ TRUE,
-      camp_binary_flag == FALSE ~ FALSE,
-      .default = NA
-    ),
-    vacc_source = case_when(
-      vacc_epi_confirmed == TRUE & camp_confirmed == TRUE ~ "both",
-      vacc_epi_confirmed == TRUE & (camp_confirmed == FALSE | is.na(camp_confirmed)) ~ "epi_only",
-      (vacc_epi_confirmed == FALSE | is.na(vacc_epi_confirmed)) & camp_confirmed == TRUE ~ "camp_only",
-      vacc_log == FALSE & (camp_confirmed == FALSE | is.na(camp_confirmed)) ~ "neither",
-      .default = "unknown"
-    ) |>
-      factor(levels = c("both", "epi_only", "camp_only", "neither", "unknown"))
+    age_yrs = as.numeric(age),
+    age_eligible = age_yrs >= 0.5 & age_yrs <= 15
   )
 
-# ---- De-identify and select down to what srvy_results.R / srvy_maps_public.R need ----
+# ---- De-identify and select down to what srvy_results.R needs ----
 
 df_ind_public <-
   df_ind |>
   select(
     index_hh, index_ind, cluster, lga, weight, hh_size, vacc_belief_protect,
-    age, age_cat, age_grp, age_grp_diph, sex,
-    vacc, vacc_pre, vacc_card, vacc_epi_binary, vacc_camp_binary, vacc_ever,
-    vacc_epi_confirmed, camp_confirmed, vacc_source, age_eligible,
+    date_int, age, age_unit, age_cat, age_grp, age_grp_diph, sex, age_eligible,
+    vacc, vacc_pre, vacc_card, vacc_camp, vacc_camp_binary, vacc_no_reason_001,
     diphtheria, diagnosis, died, died_cause, died_diph_binary, died_location,
     date_onset, date_died, pt,
     tx_seeking, tx_seeking_binary, tx_seeking_hsb, tx_location, delay_tx, delay_tx_binary,
