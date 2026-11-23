@@ -885,7 +885,8 @@ write_csv(spatial_correlations, file.path(tab_dir, "spatial_correlations.csv"))
 # indicator: column in tbl_cluster; weight_col: cluster-N column used to
 # weight the smoothing. Viridis throughout (begin/end trim the extremes so
 # contour labels stay legible); direction = -1 makes high values dark.
-plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, direction = 1, begin = 0.15, end = 0.97) {
+# contour_by: contour interval; overlapping contour labels are dropped.
+plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, contour_by, direction = 1, begin = 0.15, end = 0.97) {
   poly_win <- as.owin(shp)
   filtered_dat <- dat |> filter(!is.na(.data[[indicator]]))
   ppp_xy <- st_coordinates(filtered_dat) |> as_tibble()
@@ -905,16 +906,18 @@ plot_ppp_srvy <- function(dat, shp, indicator, weight_col, legend_name, directio
     sm_dat |>
     mutate(lon = st_coordinates(st_centroid(geometry))[, 1], lat = st_coordinates(st_centroid(geometry))[, 2]) |>
     st_drop_geometry()
+  max_v <- max(grid_points$v, na.rm = TRUE)
+  contour_breaks <- seq(0, ceiling(max_v / contour_by) * contour_by, by = contour_by)
 
   ggplot() +
     geom_sf(data = sm_dat, aes(fill = v), colour = NA) +
     geom_sf(data = st_boundary(shp_lga), colour = "grey40", linewidth = 0.4) +
     geom_sf(data = st_boundary(shp), colour = "black", linewidth = 0.8) +
-    geom_contour(data = grid_points, aes(x = lon, y = lat, z = v), colour = "grey20", linewidth = 0.3, linetype = "dashed") +
-    metR::geom_text_contour(data = grid_points, aes(x = lon, y = lat, z = v), colour = "black", size = 3, skip = 0, stroke = 0.1) +
+    geom_contour(data = grid_points, aes(x = lon, y = lat, z = v), breaks = contour_breaks, colour = "grey20", linewidth = 0.3, linetype = "dashed") +
+    metR::geom_text_contour(data = grid_points, aes(x = lon, y = lat, z = v), breaks = contour_breaks, colour = "black", size = 2, skip = 0, stroke = 0.1, check_overlap = TRUE) +
     scale_fill_viridis_c(
       option = "viridis", direction = direction, begin = begin, end = end,
-      name = legend_name, limits = c(0, max(grid_points$v, na.rm = TRUE))
+      name = legend_name, limits = c(0, max_v)
     ) +
     coord_sf(crs = st_crs(shp)) +
     theme_void()
@@ -941,14 +944,14 @@ save_plos_tif <- function(plot, file, height) {
 # campaign-eligible children, each panel on its own scale; darker always
 # means less vaccinated (the two vaccinated groups run dark = low, never
 # vaccinated dark = high)
-fig2_panel <- \(ind, lab, direction) {
-  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, "num_ppl_vacc", lab, direction = direction) +
+fig2_panel <- \(ind, lab, direction, contour_by) {
+  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, "num_ppl_vacc", lab, contour_by, direction = direction) +
     guides(fill = guide_colourbar(title.position = "top", barwidth = unit(4.2, "cm"), barheight = unit(0.3, "cm")))
 }
 figure_2 <-
-  (fig2_panel("cov_camp", "Campaign dose reported (%)", 1) + labs(title = "a")) +
-  (fig2_panel("cov_notcamp", "Vaccinated, no campaign dose (%)", 1) + labs(title = "b")) +
-  (fig2_panel("cov_never", "Never vaccinated (%)", -1) + labs(title = "c")) +
+  (fig2_panel("cov_camp", "Campaign dose reported (%)", 1, 10) + labs(title = "a")) +
+  (fig2_panel("cov_notcamp", "Vaccinated, no campaign dose (%)", 1, 5) + labs(title = "b")) +
+  (fig2_panel("cov_never", "Never vaccinated (%)", -1, 10) + labs(title = "c")) +
   plot_layout(ncol = 3) &
   map_theme
 
@@ -956,15 +959,15 @@ ggsave(file.path(fig_dir, "figure2_vaccination_coverage.jpg"), figure_2, width =
 save_plos_tif(figure_2, "Fig2.tif", height = 3.3)
 
 # S1 Figure: diphtheria attack rate and under-5 mortality, each panel on its
-# own scale, darker = higher. No vaccination panel: ever vaccinated is 100%
+# own scale, lighter = higher. No vaccination panel: ever vaccinated is 100%
 # minus Figure 2c.
-s1_panel <- \(ind, w, lab) {
-  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, w, lab, direction = -1) +
+s1_panel <- \(ind, w, lab, contour_by) {
+  plot_ppp_srvy(tbl_cluster, shp_boundary, ind, w, lab, contour_by, direction = 1) +
     guides(fill = guide_colourbar(title.position = "top", barwidth = unit(5.5, "cm"), barheight = unit(0.3, "cm")))
 }
 s1_figure <-
-  (s1_panel("attack_rate", "num_ppl", "Diphtheria attack rate (%)") + labs(title = "a")) +
-  (s1_panel("u5mr", "num_ppl_u5", "Under-5 mortality rate (per 10,000 person-days)") + labs(title = "b")) +
+  (s1_panel("attack_rate", "num_ppl", "Diphtheria attack rate (%)", 0.5) + labs(title = "a")) +
+  (s1_panel("u5mr", "num_ppl_u5", "Under-5 mortality rate (per 10,000 person-days)", 0.2) + labs(title = "b")) +
   plot_layout(ncol = 2) &
   map_theme
 
